@@ -37,7 +37,7 @@ from typing import Any
 
 from .db import Database, dumps
 from .definitions import DrillDef
-from .engine import Engine, EngineError, now_ts
+from .engine import Engine, EngineError, now_ts, reduce_events
 
 WAITING = "waiting"
 RELEASED = "released"
@@ -896,6 +896,14 @@ class JointOrchestrator:
                 ),
                 "sealed_stages": list(st.sealed.keys()),
                 "stage_order": list(st.order),
+                # Tip versions for the postmortem prefix inputs.
+                "last_version": st.last_version,
+                "last_event_at": max(
+                    [s.at for s in st.sealed.values()]
+                    + [i.at for i in st.injections.values()]
+                    + [x for x in (st.ended_at, st.started_at) if x],
+                    default=None,
+                ),
             }
         return out
 
@@ -914,6 +922,90 @@ class JointOrchestrator:
                 continue
             out.append(detail)
         return out
+
+    # ------------------------------------------------------------------ #
+    # causal-timeline postmortem (read-only deterministic review)
+    # ------------------------------------------------------------------ #
+    async def review_joint(
+        self, jid: str, raw: Any
+    ) -> dict[str, Any]:
+        """Build a consistent as-of postmortem report.
+
+        Pure read: the frozen gate definitions, each member session's pinned
+        script version and immutable event log are the only inputs; nothing in
+        ``raw`` can mutate a live or finished exercise.
+        """
+        from .postmortem import (
+            _Member,
+            build_postmortem,
+            filter_prefix_events,
+            parse_review_request,
+        )
+
+        row = await self._row(jid)
+        if row is None:
+            raise JointError("联演不存在", 404)
+        member_ids = [
+            r["session_id"]
+            for r in await self.db.all(
+                "SELECT session_id FROM joint_members WHERE joint_id=? ORDER BY ord, rowid",
+                (jid,),
+            )
+        ]
+        mode, as_of = parse_review_request(raw, member_ids)
+        prefixes = raw.get("prefixes") if mode == "prefix" else None
+
+        # Frozen gate definitions + stored runtime columns (for cross-checking
+        # the recomputed status against the live rows).
+        gate_rows = await self.db.all(
+            "SELECT gate_id, target_session, target_stage, title, public_text, views, "
+            "status FROM joint_gates WHERE joint_id=? ORDER BY rowid",
+            (jid,),
+        )
+        gates_def: list[dict[str, Any]] = []
+        for gr in gate_rows:
+            branches = await self.db.all(
+                "SELECT branch_no, session_id, stage_id, kind, role_id, value "
+                "FROM joint_branches WHERE joint_id=? AND gate_id=? ORDER BY branch_no",
+                (jid, gr["gate_id"]),
+            )
+            gates_def.append({
+                "gate_id": gr["gate_id"],
+                "target_session": gr["target_session"],
+                "target_stage": gr["target_stage"],
+                "title": gr["title"],
+                "public_text": gr["public_text"],
+                "views_obj": json.loads(gr["views"] or "{}"),
+                "status": gr["status"],
+                "branches": [dict(b) for b in branches],
+            })
+
+        members: list[_Member] = []
+        for ord_, sid in enumerate(member_ids):
+            sess, d = await self.engine.get_session_definition(sid)
+            rows = await self.db.all(
+                "SELECT version, seq, type, actor, at, payload FROM events "
+                "WHERE session_id=? ORDER BY version, seq",
+                (sid,),
+            )
+            all_events = [
+                {
+                    "version": r["version"],
+                    "seq": r["seq"],
+                    "type": r["type"],
+                    "actor": r["actor"],
+                    "at": float(r["at"]),
+                    "payload": json.loads(r["payload"]),
+                }
+                for r in rows
+            ]
+            prefix_v = prefixes[sid] if prefixes is not None else None
+            events = filter_prefix_events(all_events, mode, as_of, prefix_v)
+            members.append(
+                _Member(ord_, sess, d, all_events, events, reduce_events(events))
+            )
+
+        return build_postmortem(dict(row), members, gates_def, mode, as_of)
 
     async def session_script(self, session_id: str) -> dict[str, Any]:
         """Pinned script reference data used by the joint editor when it

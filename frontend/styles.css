@@ -197,3 +197,15 @@ label select { display: block; margin-top: 4px; min-width: 220px; }
 .box.injection .injection-title { font-weight: 700; }
 .g-views label { display: block; margin-top: 8px; }
 #joint-panel .chip { font-size: .76rem; }
+
+/* joint causal-timeline postmortem (联演因果时序复盘) */
+.review-gate { border-left: 4px solid var(--border); margin: 12px 0; }
+.review-gate.delivered { border-left-color: var(--ok); }
+.review-gate.awaiting_target { border-left-color: #314070; }
+.review-gate.unsatisfied { border-left-color: var(--warn); }
+.review-gate.missed { border-left-color: var(--danger); }
+.tl-row { padding: 7px 10px; border-bottom: 1px solid var(--border); font-size: .85rem; }
+.tl-row.joint_injection { background: #171f33; }
+.tl-row.stage_sealed { background: rgba(255,255,255,.02); }
+.tl-marks { margin-top: 3px; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.tl-marks .chip { font-size: .72rem; }

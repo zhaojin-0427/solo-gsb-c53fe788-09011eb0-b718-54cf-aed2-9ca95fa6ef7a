@@ -25,6 +25,17 @@
   会话、阶段、结局、角色均有效；重复/乱序到达不会重复投递或提前解锁；主持台显示
   **分支等待状态与阻塞原因**。注入作为事件写入**目标会话自己的事件日志**，各会话
   仍保留独立的剧本版本与事件记录。
+- **联演因果时序复盘**：主持人选择一场**已保存的联合演练**并提交**统一复盘截止
+  时刻**（或按各成员会话选择**事件版本前缀**），系统读取各成员会话**冻结剧本
+  版本**与**不可变事件日志**，按 *事件时间 → 会话顺序号 → 会话版本号 → 事件
+  序号* 稳定合并，标出每个**前置结局 / 分支命中（含结局不符）/ 目标阶段开放 /
+  联演注入 / 阶段结算**；对每条编排计算从**最后一个前置满足（AND 汇合点）**到
+  注入投递或窗口关闭的等待秒数、AND 汇合耗时与瓶颈分支，并沿**分支链**汇总
+  **关键路径与瓶颈编排**。编排状态区分为**尚未满足 / 目标未开放 / 已错过 /
+  已投递**，全部带**阻塞原因与可追溯事件引用**（`<会话>#v<版本>.<seq>`）。
+  两种截至口径都生成**一致的截至时刻报告**：严格“早于截止”的整版本前缀使
+  **同秒与迟到事件不得改写既有前缀**，同一截至时刻重复生成结果逐字节一致。
+  主持台支持按状态/成员会话/标注类型/关键字**筛选**并一键**下载 JSON**。
 
 ---
 
@@ -37,6 +48,7 @@
 │   │   ├── main.py          # FastAPI：HTTP API、WebSocket、定时结算、静态托管
 │   │   ├── engine.py        # 纯事件溯源 reducer + 原子提交（版本号/结算/幂等）
 │   │   ├── joints.py        # 联合演练编排：无环校验、AND 汇合仲裁、一次性注入投递
+│   │   ├── postmortem.py    # 联演因果时序复盘：稳定合并、等待秒数、关键路径、一致截至报告
 │   │   ├── definitions.py   # YAML 剧本解析与校验
 │   │   ├── versions.py      # 不可变版本摘要（SHA-256）与结构化差异对比
 │   │   ├── db.py            # SQLite（WAL、立即事务、事件日志、版本表与迁移）
@@ -120,7 +132,10 @@ curl -H "X-Host-Key: host-1234" "http://localhost:8000/api/sessions/<session_id>
 测试不依赖 Docker，直接在本机 Python 运行（覆盖：先加入再启动、末名提交
 自动结算、截止竞争、**连续两个限时阶段间旧定时器的身份核对**（末名提交 /
 主持人手动结算竞争，旧回调空转不产生事件、正常回调只结算一次）、并发幂等、
-任意版本前缀回放、手动终止、定时器登记薄、HTTP+WebSocket 端到端）：
+任意版本前缀回放、手动终止、定时器登记薄、HTTP+WebSocket 端到端，以及
+**联演因果时序复盘**（四态判定、AND 汇合/等待秒数、沿分支链关键路径与瓶颈、
+统一截止时刻严格前缀使同秒/迟到事件不改写、成员版本前缀一致性、证据不完整
+标记、可追溯事件引用与纯只读性））：
 
 ```bash
 cd backend
@@ -251,6 +266,10 @@ uvicorn app.main:app --reload --port 8000
    （等待中 / **前置已齐·等待目标阶段开放** / 已投递 / 已错过）以及
    **阻塞原因**。各会话自己的主持台也内嵌“🔗 联合演练状态”面板。
 5. 各会话照常开始、提交、结算；上游达成结局后系统自动仲裁并向目标会话推送。
+6. 演练后（或演练中任一刻）点 **“⏱ 因果时序复盘”**：选择**统一截止时刻**或
+   **各成员事件版本前缀**生成一致的截至时刻报告，查看四态阻塞原因、等待秒数、
+   关键路径/瓶颈与带事件引用的合并时间轴，可在主持台筛选并**下载 JSON**
+   （见下文“联演因果时序复盘”一节）。
 
 ### 一致性与边界
 
@@ -279,6 +298,146 @@ uvicorn app.main:app --reload --port 8000
 | DELETE | `/api/joints/{id}` | 删除全等待中的联演（主持人） |
 | GET | `/api/sessions/{sid}/joints` | 该会话参与的联演状态（主持台面板） |
 | GET | `/api/sessions/{sid}/script` | 该会话**绑定版本**的阶段/角色/选项（编辑器用） |
+| POST | `/api/joints/{id}/postmortem` | **联演因果时序复盘**：一致截至时刻报告（主持人，纯只读） |
+
+---
+
+## 联演因果时序复盘（多会话时间线）
+
+联合演练保存后，联演列表与监控台提供 **“⏱ 因果时序复盘”** 入口
+（`#/host/joint-review/<联演id>`）。复盘是**纯只读**分析：唯一输入是各成员会话
+创建时**冻结的剧本版本**与其**不可变事件日志**，不写入任何数据，因此对进行中或
+已结束的演练都安全，且绝不触发补投递或状态修改。
+
+### 两种一致的截至口径
+
+1. **统一复盘截止时刻（`as_of`）**：主持人提交一个 POSIX 截止时刻 `T`。一个会话
+   的某次原子提交（一个版本内的全部事件）只有在**整版事件时间都严格早于 `T`**
+   （`< T`）时才计入前缀——同一版本内事件共享同一逻辑时刻。于是：
+   - **同秒事件不计入**：在 `T` 这一秒发生的提交不会被提前纳入；
+   - **迟到事件不改写**：晚于早前某次复盘才落账的事件（例如服务重启补仲裁）不会
+     改变 `T` 时刻的前缀；
+   - 同一 `T` 重复生成的报告**逐字节一致**（纯函数，无服务端时钟参与）。
+2. **各成员会话事件版本前缀（`prefix`）**：为每个成员会话指定
+   `events.version ≤ n` 的冻结前缀，回答“从这些冻结版本各自能知道什么”。当目标
+   会话前缀已含注入、而授权它的某个上游结算位于另一会话前缀之外时，该编排仍判
+   **已投递**（注入在目标前缀内是事实），同时给出 `evidence_partial`（证据不完整）
+   标记与说明，不掩盖跨成员前缀的不一致。
+
+### 报告内容
+
+- **稳定合并时间轴**：所有成员事件按 `(at, 会话顺序号, version, seq)` 归并，标注
+  `prereq_outcome`（前置结局）、`branch_hit` / `branch_miss`（命中/结局不符）、
+  `target_open`（目标阶段开放）、`injection`（联演注入）、`target_close` 与
+  `stage_settlement`（阶段结算）、`session_end`；每行带会话与 `sid#v版本.序号`
+  事件引用。
+- **每条编排**：四态 `unsatisfied`（尚未满足）/ `awaiting_target`（目标未开放）/
+  `missed`（已错过）/ `delivered`（已投递），含每个前置分支的命中时间与结算事件
+  引用、结局不符时的实际 `next`/`choice`、阻塞原因、注入或窗口关闭事件引用。
+- **等待秒数**：`wait_seconds` = 最后一个前置满足（AND 汇合点）→ 注入投递
+  （已投递）或目标阶段结算/会话结束（已错过）的秒数；`assembly_seconds` = 首个
+  分支命中 → 末个分支命中的 AND 汇合耗时；进行中的编排给出相对截止时刻的
+  `age_seconds`；`bottleneck_branch` 标出拖慢汇合的瓶颈分支及其事件引用。
+- **关键路径 / 瓶颈**：以“注入目标节点被另一编排的前置监听”构成编排依赖边
+  （保存时已保证无环），逐门与整体给出累计等待最长的关键链与按权重排序的
+  瓶颈编排。
+- **主持台筛选**：按编排状态、成员会话、标注类型、关键字（编排/会话/事件引用）
+  联动筛选编排卡与时间轴；**⬇ 下载报告 JSON** 保存的就是服务器返回的同一份报告。
+
+### 真实复盘请求 / 响应示例
+
+以下用一场“上游值班长请求联动 → 向下游处置阶段一次性追加注入”的两会话联演
+（编排 id `linkvalve`，目标会话处于阶段 `t1`）：
+
+```bash
+# 统一截止时刻：取一个晚于全部已发生事件的 POSIX 秒
+curl -sS -H "X-Host-Key: host-1234" -H "Content-Type: application/json" \
+     -X POST http://localhost:8000/api/joints/614e7c45/postmortem \
+     -d '{"mode":"as_of","as_of":2000000000}'
+```
+
+```jsonc
+{
+  "kind": "joint_postmortem",
+  "joint_id": "614e7c45",
+  "joint_name": "厂区联合处置",
+  "mode": "as_of",
+  "as_of": 2000000000,
+  "horizon_label": "统一截止时刻 2000000000（POSIX 秒，严格小于：同秒事件不计入前缀）",
+  "members": [
+    {"ord": 0, "session_id": "f16729fe", "drill_name": "上游演练",
+     "drill_version": 1, "digest_short": "…", "status": "ended",
+     "include_version": 3, "latest_version": 3, "events_included": 6}
+  ],
+  "cutoff": {"mode": "as_of", "as_of": 2000000000,
+             "members": {"f16729fe": {"include_version": 3, "latest_version": 3,
+                                      "truncated": false}}},
+  "summary": {"total": 1, "delivered": 1, "missed": 0, "awaiting_target": 0,
+              "unsatisfied": 0, "total_delivered_wait_seconds": 0.015,
+              "total_assembly_seconds": 0.0, "max_wait_seconds": 0.015,
+              "timeline_events": 10, "evidence_partial": 0},
+  "gates": [
+    {
+      "id": "linkvalve",
+      "title": "联动关阀",
+      "target_session": "9685e6de",
+      "target_stage": "t1",
+      "target_stage_title": "联动处置",
+      "status": "delivered",
+      "status_label": "已投递",
+      "prerequisites": [
+        {"branch_no": 0, "session_id": "f16729fe", "stage_id": "s1",
+         "kind": "choice", "role_id": "a", "value": "go",
+         "label": "[上游演练] 阶段「报警确认」值班长 选择＝请求联动",
+         "satisfied": true, "satisfied_at": 1790882313.128,
+         "actual": {"next": null, "role_id": "a", "choice": "go"},
+         "event_ref": {"session_id": "f16729fe", "version": 3, "seq": 1,
+                       "type": "stage_sealed", "ref": "f16729fe#v3.1"}}
+      ],
+      "all_prerequisites_met": true,
+      "last_prerequisite_at": 1790882313.128,
+      "delivered_at": 1790882313.143,
+      "injection_ref": {"session_id": "9685e6de", "version": 3, "seq": 0,
+                        "type": "joint_injection", "ref": "9685e6de#v3.0"},
+      "close_ref": null,
+      "wait_seconds": 0.015,
+      "assembly_seconds": null,
+      "age_seconds": null,
+      "bottleneck_branch": {"branch_no": 0,
+                            "label": "[上游演练] 阶段「报警确认」值班长 选择＝请求联动",
+                            "event_ref": {"ref": "f16729fe#v3.1"},
+                            "earlier_branch_lead_seconds": []},
+      "active_blockers": [],
+      "evidence_partial": false,
+      "block_reason": "已在 9685e6de#v3.0 投递（最后前置汇合后等待 0.015 秒）",
+      "critical_path": {"gate_ids": ["linkvalve"], "cumulative_wait_seconds": 0.015}
+    }
+  ],
+  "critical_path": {"gate_ids": ["linkvalve"], "total_wait_seconds": 0.015},
+  "bottleneck_gates": [],
+  "timeline": [
+    {"at": 1790882313.143, "member_ord": 1, "session_id": "9685e6de",
+     "version": 3, "seq": 0, "type": "joint_injection",
+     "label": "联演注入追加到阶段「t1」：联动关阀",
+     "event_ref": "9685e6de#v3.0",
+     "marks": [{"kind": "injection", "gate_id": "linkvalve",
+                "label": "联演注入：联动关阀"}]}
+  ]
+}
+```
+
+按成员会话事件版本前缀的请求示例（把上游冻结在注入授权结算之前，下游取最新）：
+
+```bash
+curl -sS -H "X-Host-Key: host-1234" -H "Content-Type: application/json" \
+     -X POST http://localhost:8000/api/joints/614e7c45/postmortem \
+     -d '{"mode":"prefix","prefixes":{"f16729fe":2,"9685e6de":3}}'
+# 该前缀下上游 v3 结算尚不存在 -> gates[0].status = "unsatisfied"，
+# cutoff.members.f16729fe.truncated = true；同一前缀重复请求结果完全一致。
+```
+
+> 页面里的“取最新事件之后”会把截止时刻自动填为成员会话最后事件时间的下一秒；
+> 把截止时刻直接填成某个事件所在秒，即可观察“同秒事件不计入前缀”。
 
 ---
 
@@ -404,6 +563,7 @@ stages:
 | GET | `/api/sessions/{sid}/replay?token=&version=` | 逐版本确定性回放（主持人或参与者），顶层带 `drill_version`/`drill_sha256` |
 | GET | `/api/sessions/{sid}/record?fmt=md\|json&token=` | 全量记录（主持人）/ 个人记录（参与者），均标注剧本版本（含联演注入） |
 | GET | `/api/joints` · `POST /api/joints` · `GET/PUT/DELETE /api/joints/{id}` | 联合演练编排（主持人，见“联合演练编排”一节） |
+| POST | `/api/joints/{id}/postmortem` | **联演因果时序复盘**：统一截止时刻/成员版本前缀的一致报告（主持人） |
 | GET | `/api/sessions/{sid}/joints` · `/api/sessions/{sid}/script` | 会话的联演状态 / 绑定剧本引用（主持人） |
 
 ### WebSocket

@@ -1052,6 +1052,50 @@ def test_joint_http_ws():
         r = client.delete(f"/api/joints/{jid}", headers=HOST)
         check("删除含已投递门禁联演 409", r.status_code == 409)
 
+        # ---- causal-timeline postmortem over the delivered joint ----------
+        pm = client.post(f"/api/joints/{jid}/postmortem", headers=HOST,
+                         json={"mode": "as_of", "as_of": time.time() + 3600})
+        check("复盘接口 200 且为只读报告",
+              pm.status_code == 200 and pm.json()["kind"] == "joint_postmortem"
+              and pm.json()["joint_id"] == jid)
+        pmj = pm.json()
+        g = pmj["gates"][0]
+        check("复盘状态：已投递（含注入引用）",
+              g["status"] == "delivered" and g["injection_ref"]["session_id"] == sd
+              and g["injection_ref"]["type"] == "joint_injection")
+        check("复盘前置带命中事件引用",
+              all(p["satisfied"] and p["event_ref"]["type"] == "stage_sealed"
+                  for p in g["prerequisites"]))
+        check("复盘时间轴稳定合并且含注入标注",
+              pmj["summary"]["timeline_events"] == len(pmj["timeline"])
+              and any(
+                  m.get("kind") == "injection" and m.get("gate_id") == "g1"
+                  for e in pmj["timeline"] for m in e["marks"]))
+        check("复盘带关键路径与瓶颈数组",
+              "gate_ids" in pmj["critical_path"] and isinstance(pmj["bottleneck_gates"], list))
+        # auth + validation
+        check("复盘接口需主持人密钥",
+              client.post(f"/api/joints/{jid}/postmortem",
+                          json={"mode": "as_of", "as_of": 1}).status_code == 401)
+        check("复盘非法 mode 400",
+              client.post(f"/api/joints/{jid}/postmortem", headers=HOST,
+                          json={"mode": "nope"}).status_code == 400)
+        check("复盘 as_of 非数字被拒（422/400）",
+              client.post(f"/api/joints/{jid}/postmortem", headers=HOST,
+                          json={"mode": "as_of", "as_of": "soon"}).status_code in (400, 422))
+        check("prefix 模式缺成员 400",
+              client.post(f"/api/joints/{jid}/postmortem", headers=HOST,
+                          json={"mode": "prefix", "prefixes": {su: 9}}).status_code == 400)
+        pfx = {m["session_id"]: m["latest_version"] for m in pmj["members"]}
+        rp = client.post(f"/api/joints/{jid}/postmortem", headers=HOST,
+                         json={"mode": "prefix", "prefixes": pfx})
+        check("prefix 模式 200 且一致",
+              rp.status_code == 200 and rp.json()["mode"] == "prefix"
+              and all(m["truncated"] is False for m in rp.json()["cutoff"]["members"].values()))
+        check("不存在联演复盘 404",
+              client.post("/api/joints/zzzzzzzz/postmortem", headers=HOST,
+                          json={"mode": "as_of", "as_of": 1}).status_code == 404)
+
 
 def test_http_version_api():
     print("[11b] HTTP 版本管理 API")
@@ -1706,6 +1750,233 @@ async def test_joint_orchestration(eng):
     check("末帧快照携带注入", last["history"][0]["injections"])
 
 
+# --------------------------------------------------------------------------- #
+# [15] joint causal-timeline postmortem (联演因果时序复盘)
+# --------------------------------------------------------------------------- #
+async def test_joint_postmortem(eng):
+    print("[15] 联演因果时序复盘（稳定合并/等待秒数/关键路径/截止前缀一致性）")
+    import app.engine as emod
+    from app.postmortem import (
+        AWAITING_TARGET,
+        DELIVERED,
+        REVIEW_MISSED,
+        UNSATISFIED,
+        filter_prefix_events,
+        parse_review_request,
+    )
+
+    # Pure prefix rules: whole-version atomicity under as_of (strict <), and
+    # exact version inclusion under prefix.
+    evs = [
+        {"version": 1, "seq": 0, "at": 10.0},
+        {"version": 2, "seq": 0, "at": 20.0},
+        {"version": 2, "seq": 1, "at": 20.0},
+        {"version": 3, "seq": 0, "at": 30.0},
+    ]
+    check("as_of 严格小于：同秒整版排除",
+          [e["version"] for e in filter_prefix_events(evs, "as_of", 20.0, None)] == [1])
+    check("as_of 含早于截止的整版",
+          [e["version"] for e in filter_prefix_events(evs, "as_of", 20.5, None)] == [1, 2, 2])
+    check("prefix 按版本前缀",
+          [e["version"] for e in filter_prefix_events(evs, "prefix", None, 2)] == [1, 2, 2])
+    jo = JointOrchestrator(eng.db, eng)
+    real_now = emod.now_ts
+    clock = {"t": 5000.0}
+    emod.now_ts = lambda: clock["t"]
+    try:
+        su = await eng.create_session("jup")
+        su2 = await eng.create_session("jup2")
+        sd = await eng.create_session("jdown")
+        for sid, invite in ((su, "AAA"), (su2, "CCC"), (sd, "BBB")):
+            await eng.join(sid, invite, "n")
+            await eng.start(sid)
+
+        # g1: AND(su/s1 a=go @ t1, su2/s1 c=go @ t1+20) -> sd/t1 (delivered)
+        # g2: sd/t1 next=t2 -> su/s2 (delivered once downstream seals), which
+        #     chains after g1: su/s1 -> sd/t1 -> su/s2.
+        spec = {
+            "name": "复盘链演", "members": [su, su2, sd],
+            "gates": [
+                {"id": "g1", "target_session": sd, "target_stage": "t1",
+                 "title": "一级注入", "public": "P",
+                 "prerequisites": [
+                     {"session_id": su, "stage_id": "s1", "kind": "choice",
+                      "role_id": "a", "value": "go"},
+                     {"session_id": su2, "stage_id": "s1", "kind": "choice",
+                      "role_id": "c", "value": "go"}]},
+                {"id": "g2", "target_session": su, "target_stage": "s2",
+                 "title": "二级注入", "public": "Q",
+                 "prerequisites": [{"session_id": sd, "stage_id": "t1",
+                                    "kind": "next_stage", "value": "t2"}]},
+            ],
+        }
+        jid = (await jo.create_joint(spec))["id"]
+
+        # g3: a gate whose outcome never matches and whose target seals early
+        # -> missed with a traceable close ref.
+        sd2 = await eng.create_session("jdown")
+        await eng.join(sd2, "BBB", "n")
+        await eng.start(sd2)
+        spec_m = {
+            "name": "错过复盘演", "members": [su, sd2],
+            "gates": [{"id": "m1", "target_session": sd2, "target_stage": "t1",
+                       "public": "x",
+                       "prerequisites": [{"session_id": su, "stage_id": "s1",
+                                          "kind": "next_stage", "value": ""}]}],
+        }
+        jidm = (await jo.create_joint(spec_m))["id"]
+
+        rep = await jo.review_joint(jid, {"mode": "as_of", "as_of": 5001.0})
+        g1 = rep["gates"][0]
+        check("开局：编排尚未满足", g1["status"] == UNSATISFIED
+              and len(g1["active_blockers"]) == 2 and g1["wait_seconds"] is None)
+
+        # first branch at 5010
+        clock["t"] = 5010.0
+        await eng.submit(su, "a", "s1", "go")
+        await jo.reconcile_session(su)
+        rep = await jo.review_joint(jid, {"mode": "as_of", "as_of": 5015.0})
+        g1 = rep["gates"][0]
+        check("单分支命中后仍尚未满足、按截止时刻计等待",
+              g1["status"] == UNSATISFIED and g1["age_seconds"] == 5.0)
+        check("成员前缀按统一时刻裁剪（su 结算含入、su2 尚未动作）",
+              next(m for m in rep["members"] if m["session_id"] == su)["include_version"] >= 3
+              and next(m for m in rep["members"] if m["session_id"] == su2)["include_version"] == 2)
+
+        # strict cutoff: same-second events must not enter the prefix
+        rep_eq = await jo.review_joint(jid, {"mode": "as_of", "as_of": 5010.0})
+        g1_eq = rep_eq["gates"][0]
+        check("同秒事件不改写前缀（严格小于）",
+              g1_eq["status"] == UNSATISFIED and all(
+                  not p["satisfied"] for p in g1_eq["prerequisites"]))
+
+        # second branch at 5030 -> AND join; target t1 open -> g1 delivered
+        clock["t"] = 5030.0
+        await eng.submit(su2, "c", "u1", "go") if False else await eng.submit(su2, "c", "s1", "go")
+        delivered = await jo.reconcile_session(su2)
+        check("AND 汇合后投递", delivered == {sd})
+        rep = await jo.review_joint(jid, {"mode": "as_of", "as_of": 6000.0})
+        g1, g2 = rep["gates"]
+        check("g1 已投递、汇合后零等待", g1["status"] == DELIVERED
+              and g1["wait_seconds"] == 0.0)
+        check("AND 汇合耗时=慢分支滞后 20 秒", g1["assembly_seconds"] == 20.0
+              and g1["bottleneck_branch"]["earlier_branch_lead_seconds"] == [20.0])
+        check("可追溯注入事件引用", g1["injection_ref"]
+              and g1["injection_ref"]["type"] == "joint_injection"
+              and g1["injection_ref"]["ref"].startswith(sd + "#v"))
+        check("g2 前置未满足（下游 t1 未结算）", g2["status"] == UNSATISFIED)
+
+        # downstream seals t1 -> t2 at 5050: g2 releases into su/s2 (already
+        # open since 5010); critical path g1(20s assembly) -> g2(0).
+        clock["t"] = 5050.0
+        await eng.submit(sd, "b", "t1", "k")
+        await jo.reconcile_session(sd)
+        rep = await jo.review_joint(jid, {"mode": "as_of", "as_of": 6000.0})
+        g1, g2 = rep["gates"]
+        check("g2 已投递", g2["status"] == DELIVERED and g2["injection_ref"]
+              and g2["injection_ref"]["session_id"] == su)
+        check("g2 关键路径沿分支链汇总为 g1→g2",
+              g2["critical_path"]["gate_ids"] == ["g1", "g2"]
+              and g2["critical_path"]["cumulative_wait_seconds"] == 20.0)
+        check("整体关键路径与瓶颈门为 g1（20 秒汇合）",
+              rep["critical_path"]["gate_ids"] == ["g1"]
+              and rep["critical_path"]["total_wait_seconds"] == 20.0
+              and rep["bottleneck_gates"][0]["gate_id"] == "g1")
+
+        # timeline: stable merge order + every required mark present
+        marks = [(m["kind"], m.get("gate_id")) for e in rep["timeline"] for m in e["marks"]]
+        for want in ("prereq_outcome", "branch_hit", "target_open", "injection",
+                     "target_close", "stage_settlement"):
+            check(f"时间轴标注含 {want}", any(k == want for k, _ in marks))
+        keys = [(e["at"], e["member_ord"], e["version"], e["seq"]) for e in rep["timeline"]]
+        check("时间轴按时间/会话顺序号/版本/事件序号稳定合并", keys == sorted(keys))
+        check("时间轴事件带会话与 v.seq 引用",
+              all(e["event_ref"].count("#v") == 1 for e in rep["timeline"]))
+
+        # determinism: re-running the same cutoff is byte-identical
+        rep2 = await jo.review_joint(jid, {"mode": "as_of", "as_of": 6000.0})
+        check("同一截止时刻重复生成报告完全一致",
+              json.dumps(rep, sort_keys=True) == json.dumps(rep2, sort_keys=True))
+
+        # late event safety: the earlier 5015 report stays identical after new
+        # events land (it only depends on the immutable prefix).
+        rep_old = await jo.review_joint(jid, {"mode": "as_of", "as_of": 5015.0})
+        rep_old_b = json.loads(json.dumps(rep_old))
+        await eng.settle(su, "host")
+        check("迟到事件不改写既有截止前缀",
+              json.dumps(rep_old, sort_keys=True) == json.dumps(rep_old_b, sort_keys=True))
+
+        # prefix mode: freeze su2 one version before its satisfying seal AND
+        # the target session before the injection. g1 must be unsatisfied even
+        # at "now", with per-session truncation shown.
+        full = await jo.review_joint(jid, {"mode": "as_of", "as_of": 9e9})
+        prefs = {}
+        for m in full["members"]:
+            prefs[m["session_id"]] = m["latest_version"]
+        su2_full = next(m for m in full["members"] if m["session_id"] == su2)
+        prefs[su2] = su2_full["latest_version"] - 1
+        # Truncate the target session before its injection version too, so the
+        # prefix genuinely reflects "the slow branch had not hit yet".
+        prefs[sd] = 2
+        rp = await jo.review_joint(jid, {"mode": "prefix", "prefixes": prefs})
+        check("按成员版本前缀：慢分支前缀外时 g1 尚未满足",
+              rp["gates"][0]["status"] == UNSATISFIED
+              and rp["cutoff"]["members"][su2]["truncated"] is True
+              and rp["gates"][0]["injection_ref"] is None)
+        # If only the upstream branch is truncated but the target keeps the
+        # delivered injection, it stays delivered — with evidence_partial
+        # flagging the truncated causal evidence.
+        prefs2 = dict(prefs)
+        sd_full = next(m for m in full["members"] if m["session_id"] == sd)
+        prefs2[sd] = sd_full["latest_version"]
+        rp3 = await jo.review_joint(jid, {"mode": "prefix", "prefixes": prefs2})
+        check("目标前缀含注入而上游前缀外：已投递且标注证据不完整",
+              rp3["gates"][0]["status"] == DELIVERED
+              and rp3["gates"][0]["evidence_partial"] is True
+              and rp3["summary"]["evidence_partial"] == 1)
+        rp2 = await jo.review_joint(jid, {"mode": "prefix", "prefixes": dict(prefs)})
+        check("同一组版本前缀报告一致",
+              json.dumps(rp, sort_keys=True) == json.dumps(rp2, sort_keys=True))
+        try:
+            parse_review_request({"mode": "prefix", "prefixes": {su: 1}}, [su, sd])
+            check("前缀缺少成员被拒", False)
+        except Exception:
+            check("前缀缺少成员被拒", True)
+
+        # missed gate: outcome never matches (su/s1 sealed -> s2, gate wants
+        # the drill end "") and target t1 seals at 5060 -> missed.
+        clock["t"] = 5060.0
+        await eng.settle(sd2, "host")
+        await jo.reconcile_session(sd2)
+        rmp = await jo.review_joint(jidm, {"mode": "as_of", "as_of": 6000.0})
+        m1 = rmp["gates"][0]
+        check("目标窗口先关：已错过且不补投", m1["status"] == REVIEW_MISSED
+              and m1["injection_ref"] is None and m1["close_ref"] is not None)
+        check("错过原因含可追溯结算引用与未满足前置",
+              m1["close_ref"]["type"] == "stage_sealed" and "未满足" in m1["block_reason"])
+        n = await eng.db.one(
+            "SELECT COUNT(*) AS n FROM events WHERE session_id=? AND type='joint_injection'",
+            (sd2,))
+        check("复盘只读：不错生任何注入事件", n["n"] == 0)
+
+        # awaiting-target gate (ready before the target stage ever opens)
+        sd3 = await eng.create_session("jdown")
+        jidw = (await jo.create_joint({
+            "name": "等开放", "members": [su, sd3],
+            "gates": [{"id": "w1", "target_session": sd3, "target_stage": "t1",
+                       "public": "x",
+                       "prerequisites": [{"session_id": su, "stage_id": "s1",
+                                          "kind": "choice", "role_id": "a",
+                                          "value": "go"}]}],
+        }))["id"]
+        rw = await jo.review_joint(jidw, {"mode": "as_of", "as_of": 6000.0})
+        check("前置已齐但目标未开放", rw["gates"][0]["status"] == AWAITING_TARGET
+              and "等待会话进入阶段" in rw["gates"][0]["block_reason"]
+              and "尚未开放" in rw["gates"][0]["block_reason"])
+    finally:
+        emod.now_ts = real_now
+
+
 async def test_cross_session_write_serialization(eng):
     print("[13b] 跨会话写事务在共享连接上串行化")
     # Two DIFFERENT sessions hold two different session locks; their write
@@ -1751,6 +2022,7 @@ async def engine_tests():
         await test_end_session(eng)
         await test_script_versions(eng)
         await test_joint_orchestration(eng)
+        await test_joint_postmortem(eng)
         await test_cross_session_write_serialization(eng)
     finally:
         await db.close()

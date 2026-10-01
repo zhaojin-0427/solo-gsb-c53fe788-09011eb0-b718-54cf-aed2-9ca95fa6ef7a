@@ -50,6 +50,15 @@ function el(html) {
   return wrap.firstElementChild;
 }
 
+// Append a <tr> built from an HTML string. A bare <tr> cannot be parsed via a
+// <div> wrapper (the parser fosters its cells out and drops the row), so the
+// row must be created through the table API and populated via innerHTML.
+function addRow(tbody, html) {
+  const tr = tbody.insertRow(-1);
+  tr.innerHTML = html;
+  return tr;
+}
+
 async function api(path, opts = {}) {
   const headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
   if (opts.host) headers["X-Host-Key"] = HOST_KEY();
@@ -190,6 +199,10 @@ function route() {
   if (parts[0] === "host" && parts[1] === "joint" && parts[2]) {
     navContext.textContent = `主持人 · 联合演练编排`;
     return jointEditPage(parts[2]);
+  }
+  if (parts[0] === "host" && parts[1] === "joint-review" && parts[2]) {
+    navContext.textContent = "主持人 · 联演因果时序复盘";
+    return jointReviewPage(parts[2]);
   }
   if (parts[0] === "host" && parts[1] === "joints") {
     navContext.textContent = "主持人 · 联合演练";
@@ -436,6 +449,7 @@ async function jointsPage() {
           <span class="chip danger">错过 ${j.missed_count}</span>
           <span class="muted small">${j.member_count} 个会话 · ${j.gate_count} 条编排</span>
           <span class="spacer"></span>
+          <a href="#/host/joint-review/${esc(j.id)}"><button class="ghost">⏱ 因果时序复盘</button></a>
           <a href="#/host/joint/${esc(j.id)}"><button class="ghost">打开编排 / 监控台</button></a>
         </div>
         <div class="muted small">${esc(j.description || "")}</div>
@@ -453,12 +467,11 @@ async function jointsPage() {
       <th>会话</th><th>剧本（绑定版本）</th><th>状态</th></tr></thead><tbody></tbody></table>`);
     for (const s of sessions) {
       const [label, cls] = statusChip(s.status);
-      tbl.querySelector("tbody").appendChild(el(`<tr>
+      addRow(tbl.querySelector("tbody"), `
         <td class="mono">${esc(s.id)}</td>
         <td>${esc(s.drill_name || s.drill_id)}
           <span class="chip mono">v${esc(s.drill_version)} · ${esc(s.digest_short || "")}</span></td>
-        <td><span class="chip ${cls}">${label}</span></td>
-      </tr>`));
+        <td><span class="chip ${cls}">${label}</span></td>`);
     }
     picker.appendChild(tbl);
   }
@@ -503,6 +516,7 @@ async function jointEditPage(jid) {
         ${detail ? `<span class="chip mono">${esc(detail.id)}</span>` : ""}
         <span class="spacer"></span>
         <a href="#/host/joints"><button class="ghost">← 返回列表</button></button></a>
+        ${detail ? '<a href="#/host/joint-review/' + esc(detail.id) + '"><button class="ghost">⏱ 因果时序复盘</button></a>' : ""}
         ${detail ? '<button class="danger" id="delete-joint">删除联演</button>' : ""}
       </div>
       <label>联演名称</label>
@@ -558,15 +572,13 @@ async function jointEditPage(jid) {
   </tr></thead><tbody></tbody></table>`);
   for (const s of sessions) {
     const [label, cls] = statusChip(s.status);
-    const tr = el(`<tr>
+    addRow(tbl.querySelector("tbody"), `
       <td><input type="checkbox" data-sid="${esc(s.id)}" ${selected.has(s.id) ? "checked" : ""}/></td>
       <td class="mono">${esc(s.id)}
         <a href="#/host/session/${esc(s.id)}" target="_blank"><button class="ghost" style="padding:2px 8px">主持台↗</button></a></td>
       <td>${esc(s.drill_name || s.drill_id)}
         <span class="chip mono">v${esc(s.drill_version)} · ${esc(s.digest_short || "")}</span></td>
-      <td><span class="chip ${cls}">${label}</span></td>
-    </tr>`);
-    tbl.querySelector("tbody").appendChild(tr);
+      <td><span class="chip ${cls}">${label}</span></td>`);
   }
   memberBox.appendChild(tbl);
   if (!sessions.length) {
@@ -937,6 +949,460 @@ function renderMonitor(box, j) {
   }).join("");
   box.innerHTML = "";
   box.append(summary, membersCard, el(`<h3>注入编排与依赖状态</h3>`), el(gatesHtml || '<p class="muted small">无编排。</p>'));
+}
+
+// --------------------------------------------------------------------------- //
+// host: 联演因果时序复盘 (#/host/joint-review/<id>)
+// --------------------------------------------------------------------------- //
+const REVIEW_STATUS = {
+  delivered: ["已投递", "ok"],
+  missed: ["已错过", "danger"],
+  awaiting_target: ["目标未开放", "host"],
+  unsatisfied: ["尚未满足", "warn"],
+};
+
+async function jointReviewPage(jid) {
+  app.innerHTML = `<div class="card"><h2>⏱ 联演因果时序复盘</h2><p class="muted">加载联演与成员会话…</p></div>`;
+  let detail;
+  try {
+    detail = await api(`/api/joints/${encodeURIComponent(jid)}`, { host: true });
+  } catch (e) {
+    app.innerHTML = `<div class="card"><h2>联演因果时序复盘</h2>
+      <p class="chip danger">${esc(e.message)}</p>
+      <a href="#/host/joints"><button class="ghost">返回联演列表</button></a></div>`;
+    return;
+  }
+  jid = detail.id;
+
+  // The latest event tip per member (for cutoff/prefill defaults).
+  const latestTip = Math.max(...detail.members.map((m) => m.last_event_at || 0), 0);
+
+  const root = el(`<div>
+    <div class="card">
+      <div class="row">
+        <h2 style="margin:0">⏱ ${esc(detail.name)}</h2>
+        <span class="chip mono">${esc(detail.id)}</span>
+        <span class="spacer"></span>
+        <a href="#/host/joint/${esc(detail.id)}"><button class="ghost">← 返回监控台</button></a>
+        <a href="#/host/joints"><button class="ghost">联演列表</button></a>
+      </div>
+      <p class="muted small">${esc(detail.description || "")}</p>
+      <p class="muted small" style="margin-bottom:0">
+        系统读取各成员会话<strong>冻结剧本版本</strong>与<strong>不可变事件日志</strong>，
+        按事件时间、会话顺序号、版本/事件序号稳定合并；标出前置结局、分支命中、
+        目标阶段开放、联演注入与阶段结算；沿分支链汇总关键路径与瓶颈。
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>1. 选择复盘截至时刻</h2>
+      <div class="row">
+        <label class="small"><input type="radio" name="rvmode" value="as_of" checked />
+          <strong>统一复盘截止时刻</strong></label>
+        <label class="small"><input type="radio" name="rvmode" value="prefix" />
+          <strong>各成员会话事件版本前缀</strong></label>
+      </div>
+
+      <div id="mode-asof">
+        <label class="small">统一截止时刻（浏览器本地时区；仅统计严格早于该时刻的整版本提交，
+          同秒与迟到事件不会计入，保证重复生成一致）</label>
+        <div class="row">
+          <input type="datetime-local" step="1" id="asof-input" style="max-width:260px" />
+          <button class="ghost" id="asof-now">取最新事件之后</button>
+          <span class="muted small mono" id="asof-epoch"></span>
+        </div>
+      </div>
+
+      <div id="mode-prefix" hidden>
+        <label class="small">为每个成员会话指定冻结的事件版本号前缀（0 = 仅创建后状态；
+          前缀外的注入/结算不计入，可还原“当时能知道什么”）</label>
+        <div id="prefix-box" class="joint-members"></div>
+      </div>
+
+      <div class="row" style="margin-top:10px">
+        <button id="run-review">生成截至时刻报告</button>
+        <span id="review-state" class="muted small"></span>
+      </div>
+    </div>
+
+    <div id="report-slot"></div>
+  </div>`);
+  app.innerHTML = "";
+  app.appendChild(root);
+
+  // ---- mode toggle / inputs ----------------------------------------------
+  const asofBox = root.querySelector("#mode-asof");
+  const prefixBox = root.querySelector("#mode-prefix");
+  root.querySelectorAll('input[name=rvmode]').forEach((r) => {
+    r.onchange = () => {
+      const mode = root.querySelector('input[name=rvmode]:checked').value;
+      asofBox.hidden = mode !== "as_of";
+      prefixBox.hidden = mode !== "prefix";
+    };
+  });
+
+  // datetime-local <-> epoch helper
+  const asofInput = root.querySelector("#asof-input");
+  const epochLabel = root.querySelector("#asof-epoch");
+  function epochFromInput() {
+    const v = asofInput.value;
+    if (!v) return null;
+    // datetime-local has no tz suffix; Date interprets it as local time.
+    const t = new Date(v).getTime() / 1000;
+    return Number.isFinite(t) ? t : null;
+  }
+  function syncEpoch() {
+    const t = epochFromInput();
+    epochLabel.textContent = t == null ? "" : `POSIX ${t} 秒`;
+  }
+  asofInput.onchange = syncEpoch;
+  asofInput.oninput = syncEpoch;
+  root.querySelector("#asof-now").onclick = () => {
+    const t = (latestTip || Date.now() / 1000) + 1;
+    const d = new Date(t * 1000);
+    const pad = (n) => String(n).padStart(2, "0");
+    asofInput.value = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+      + `T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    syncEpoch();
+  };
+  // default: just after the latest event
+  root.querySelector("#asof-now").click();
+
+  // prefix inputs (one per member, default latest version)
+  const pBox = root.querySelector("#prefix-box");
+  const tbl = el(`<table><thead><tr>
+    <th>会话顺序号</th><th>会话</th><th>剧本（冻结版本）</th><th>事件版本前缀</th>
+  </tr></thead><tbody></tbody></table>`);
+  detail.members.forEach((m, i) => {
+    // Build rows via the table API: el() wraps markup in a <div>, whose
+    // innerHTML parser would drop a bare <tr> and keep only its cells.
+    const tr = tbl.querySelector("tbody").insertRow(-1);
+    tr.innerHTML = `
+      <td class="mono">#${i}</td>
+      <td class="mono">${esc(m.session_id)} · ${esc(m.drill_name)}</td>
+      <td><span class="chip mono">v${esc(m.drill_version)} · ${esc(m.digest_short)}</span>
+        <span class="chip ${m.status === "running" ? "ok" : m.status === "ended" ? "danger" : "warn"}">
+          ${({ created: "未开始", running: "进行中", ended: "已结束" })[m.status] || m.status}</span></td>
+      <td><input type="number" min="0" step="1" class="prefix-in" data-sid="${esc(m.session_id)}"
+         value="${m.last_version ?? 0}" style="max-width:110px" />
+        <span class="muted small">/ ${m.last_version ?? 0}</span></td>`;
+  });
+  pBox.appendChild(tbl);
+
+  let currentReport = null;
+  function downloadReport() {
+    if (!currentReport) { toast("请先生成复盘报告", "error"); return; }
+    const blob = new Blob([JSON.stringify(currentReport, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `joint-review-${currentReport.joint_id}-${currentReport.mode}`
+      + `-${currentReport.mode === "as_of" ? Math.floor(currentReport.as_of) : "prefix"}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    toast("报告 JSON 已下载", "ok");
+  }
+
+  // ---- run report ---------------------------------------------------------
+  root.querySelector("#run-review").onclick = async () => {
+    const state = root.querySelector("#review-state");
+    const mode = root.querySelector('input[name=rvmode]:checked').value;
+    let body;
+    if (mode === "as_of") {
+      const asOf = epochFromInput();
+      if (asOf == null) { state.textContent = "请选择有效的截止时刻"; return; }
+      body = { mode: "as_of", as_of: asOf };
+    } else {
+      const prefixes = {};
+      for (const inp of pBox.querySelectorAll(".prefix-in")) {
+        const v = Number(inp.value);
+        if (!Number.isInteger(v) || v < 0) {
+          state.textContent = `会话 ${inp.dataset.sid} 的前缀需是非负整数`;
+          return;
+        }
+        prefixes[inp.dataset.sid] = v;
+      }
+      body = { mode: "prefix", prefixes };
+    }
+    state.textContent = "生成中…";
+    try {
+      currentReport = await api(`/api/joints/${encodeURIComponent(jid)}/postmortem`,
+        { method: "POST", host: true, body });
+      renderReviewReport(root.querySelector("#report-slot"), currentReport, downloadReport);
+      state.textContent = "已生成（同一截至时刻重复生成结果一致）";
+    } catch (e) {
+      state.textContent = "";
+      toast(e.message, "error");
+    }
+  };
+}
+
+// ---- review report rendering + host filters ------------------------------- //
+function renderReviewReport(slot, rep, onDownload) {
+  const s = rep.summary;
+  const root = el(`<div>
+    <div class="card">
+      <div class="row">
+        <h2 style="margin:0">2. 截至时刻报告</h2>
+        <span class="chip ${rep.mode === "as_of" ? "host" : ""}">
+          ${rep.mode === "as_of" ? "统一截止时刻" : "成员版本前缀"}</span>
+        ${rep.mode === "as_of" ? `<span class="chip mono">${fmtTime(rep.as_of)}</span>` : ""}
+        ${s.evidence_partial ? `<span class="chip warn">${s.evidence_partial} 条编排证据不完整</span>` : ""}
+        <span class="spacer"></span>
+        <button id="download-json">⬇ 下载报告 JSON</button>
+      </div>
+      <p class="muted small">${esc(rep.horizon_label)}</p>
+      <div class="row" style="margin-top:8px">
+        <span class="chip ok">已投递 ${s.delivered}</span>
+        <span class="chip host">目标未开放 ${s.awaiting_target}</span>
+        <span class="chip warn">尚未满足 ${s.unsatisfied}</span>
+        <span class="chip danger">已错过 ${s.missed}</span>
+        <span class="muted small">共 ${s.total} 条编排 · 合并事件 ${s.timeline_events} 个</span>
+      </div>
+      <div class="muted small" style="margin-top:6px">
+        已投递注入汇合后等待合计 <b>${s.total_delivered_wait_seconds ?? 0}</b> 秒；
+        最大汇合后等待 <b>${s.max_wait_seconds ?? "—"}</b> 秒；
+        AND 汇合耗时合计 <b>${s.total_assembly_seconds ?? 0}</b> 秒。
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>主持台筛选</h2>
+      <div class="row">
+        <label class="small">编排状态
+          <select id="f-status">
+            <option value="">全部</option>
+            <option value="delivered">已投递</option>
+            <option value="awaiting_target">目标未开放</option>
+            <option value="unsatisfied">尚未满足</option>
+            <option value="missed">已错过</option>
+          </select></label>
+        <label class="small">成员会话
+          <select id="f-member"><option value="">全部</option>
+            ${rep.members.map((m) => `<option value="${esc(m.session_id)}">
+              #${m.ord} ${esc(m.session_id)} · ${esc(m.drill_name)}</option>`).join("")}
+          </select></label>
+        <label class="small">标注类型
+          <select id="f-mark">
+            <option value="">全部事件</option>
+            <option value="prereq_outcome">前置结局</option>
+            <option value="branch_hit">分支命中</option>
+            <option value="branch_miss">分支不符</option>
+            <option value="target_open">目标阶段开放</option>
+            <option value="target_close">目标阶段结算</option>
+            <option value="injection">联演注入</option>
+            <option value="stage_settlement">阶段结算</option>
+            <option value="session_end">会话结束</option>
+          </select></label>
+        <input type="text" id="f-text" placeholder="按编排/会话/引用关键字过滤" style="max-width:240px" />
+        <span class="spacer"></span>
+        <span id="f-count" class="muted small"></span>
+      </div>
+    </div>
+
+    <div class="card" id="cp-card"><h2>3. 关键路径与瓶颈</h2><div id="cp-body"></div></div>
+    <div class="card"><h2>4. 成员会话前缀</h2><div id="members-body"></div></div>
+    <div class="card"><h2>5. 注入编排逐条复盘</h2><div id="gates-body"></div></div>
+    <div class="card"><h2>6. 统一合并时间轴（因果时序）</h2>
+      <p class="muted small">排序键：事件时间 → 会话顺序号 → 会话版本号 → 事件序号（稳定合并）。</p>
+      <div id="timeline-body"></div>
+    </div>
+  </div>`);
+
+  // download: the exact JSON the server produced (re-fetch-free, same bytes)
+  root.querySelector("#download-json").onclick = () => onDownload();
+
+  // critical path
+  const cp = rep.critical_path;
+  const cpBody = root.querySelector("#cp-body");
+  if (cp.gates && cp.gates.length) {
+    cpBody.appendChild(el(`<div class="box">
+      <div class="row"><strong>关键路径（沿分支链累计等待）：</strong>
+        ${cp.gates.map((g, i) =>
+          `<span class="chip ${REVIEW_STATUS[g.status][1]}">${esc(g.title)}</span>`
+          + (i < cp.gates.length - 1 ? '<span class="muted">→</span>' : "")).join("")}
+        <span class="spacer"></span><span class="chip mono">累计 ${cp.total_wait_seconds ?? 0} 秒</span>
+      </div>
+      <table><thead><tr><th>编排</th><th>状态</th><th>汇合后等待(秒)</th>
+        <th>AND 汇合(秒)</th><th>截至时等待中(秒)</th><th>瓶颈分支</th></tr></thead><tbody>
+      ${cp.gates.map((g) => `<tr>
+        <td>${esc(g.title)} <code>${esc(g.gate_id)}</code></td>
+        <td>${esc(REVIEW_STATUS[g.status][0])}</td>
+        <td class="mono">${g.wait_seconds ?? "—"}</td>
+        <td class="mono">${g.assembly_seconds ?? "—"}</td>
+        <td class="mono">${g.age_seconds ?? "—"}</td>
+        <td>${g.bottleneck_branch ? esc(g.bottleneck_branch.label)
+          + ` <code>${esc(g.bottleneck_branch.event_ref?.ref || "")}</code>` : "—"}</td>
+      </tr>`).join("")}
+      </tbody></table>
+    </div>`));
+  } else {
+    cpBody.appendChild(el(`<p class="muted small">无已产生等待的链路。</p>`));
+  }
+  if (rep.bottleneck_gates && rep.bottleneck_gates.length) {
+    cpBody.appendChild(el(`<div><strong>瓶颈编排排序：</strong>
+      <ol class="small">${rep.bottleneck_gates.map((b) =>
+        `<li><span class="chip ${REVIEW_STATUS[b.status][1]}">${esc(REVIEW_STATUS[b.status][0])}</span>
+         ${esc(b.title)} <code>${esc(b.gate_id)}</code> — 权重 <b class="mono">${b.weight_seconds}</b> 秒
+         （汇合 ${b.assembly_seconds ?? 0}s${b.wait_seconds != null ? `，汇合后 ${b.wait_seconds}s` : ""}）</li>`).join("")}
+      </ol></div>`));
+  }
+
+  // members prefix
+  root.querySelector("#members-body").innerHTML = `<table><thead><tr>
+    <th>#</th><th>会话</th><th>剧本冻结版本</th><th>状态</th><th>当前阶段</th>
+    <th>纳入版本</th><th>最新版本</th><th>纳入事件</th>
+  </tr></thead><tbody>
+  ${rep.members.map((m) => `<tr>
+    <td class="mono">#${m.ord}</td>
+    <td class="mono">${esc(m.session_id)}<div class="muted small">${esc(m.drill_name)}</div></td>
+    <td><span class="chip mono">v${esc(m.drill_version)} · ${esc(m.digest_short)}</span></td>
+    <td>${({ created: "未开始", running: "进行中", ended: "已结束" })[m.status] || m.status}</td>
+    <td>${esc(m.current_stage_title || "—")}</td>
+    <td class="mono">v${m.include_version}${m.include_version < m.latest_version
+      ? ' <span class="chip warn">截断</span>' : ""}</td>
+    <td class="mono">v${m.latest_version}</td>
+    <td class="mono">${m.events_included}</td>
+  </tr>`).join("")}</tbody></table>`;
+
+  // gates
+  const gatesBody = root.querySelector("#gates-body");
+  rep.gates.forEach((g, i) => gatesBody.appendChild(reviewGateCard(g, i)));
+
+  // timeline
+  const tlBody = root.querySelector("#timeline-body");
+  const tlRows = rep.timeline.map((e) => reviewTimelineRow(e, rep));
+  tlBody.appendChild(el(`<div id="tl-list">${tlRows.map((r) => r.outerHTML).join("")}</div>`));
+
+  // ---- filters ------------------------------------------------------------
+  const fStatus = root.querySelector("#f-status");
+  const fMember = root.querySelector("#f-member");
+  const fMark = root.querySelector("#f-mark");
+  const fText = root.querySelector("#f-text");
+  const fCount = root.querySelector("#f-count");
+
+  function applyFilters() {
+    const st = fStatus.value, mem = fMember.value, mk = fMark.value;
+    const q = fText.value.trim().toLowerCase();
+    let gShown = 0;
+    gatesBody.querySelectorAll(".review-gate").forEach((card) => {
+      const ok = (!st || card.dataset.status === st)
+        && (!mem || card.dataset.members.split(",").includes(mem))
+        && (!q || card.dataset.text.includes(q));
+      card.hidden = !ok;
+      if (ok) gShown++;
+    });
+    let tShown = 0;
+    tlBody.querySelectorAll(".tl-row").forEach((row) => {
+      const marks = JSON.parse(row.dataset.marks || "[]");
+      const ok = (!mem || row.dataset.session === mem)
+        && (!mk || marks.includes(mk))
+        && (!st || (row.dataset.gates ? JSON.parse(row.dataset.gates).some(
+              (gg) => gg.status === st) : false))
+        && (!q || row.dataset.text.includes(q));
+      row.hidden = !ok;
+      if (ok) tShown++;
+    });
+    fCount.textContent = `显示 ${gShown}/${rep.gates.length} 条编排 · ${tShown}/${rep.timeline.length} 个事件`;
+  }
+  [fStatus, fMember, fMark].forEach((x) => x.onchange = applyFilters);
+  fText.oninput = applyFilters;
+  applyFilters();
+
+  slot.innerHTML = "";
+  slot.appendChild(root);
+}
+
+function reviewGateCard(g, i) {
+  const [sLabel, sCls] = REVIEW_STATUS[g.status] || [g.status, ""];
+  const members = new Set([g.target_session, ...g.prerequisites.map((p) => p.session_id)]);
+  const branches = g.prerequisites.map((p) => `
+    <li class="${p.satisfied ? "branch-met" : "branch-waiting"}">
+      <span>${p.satisfied ? "✅" : "⏳"}</span>
+      <span>${esc(p.label)}</span>
+      ${p.satisfied
+        ? `<span class="muted small">命中于 ${fmtClock(p.satisfied_at)}
+           <code>${esc(p.event_ref?.ref || "")}</code></span>`
+        : (p.outcome_match === false
+          ? `<span class="chip danger">结局不符</span>
+             <span class="muted small">实际 next=<code>${esc(String(p.actual?.next))}</code>
+             ${p.actual?.choice !== undefined ? `选择=<code>${esc(String(p.actual.choice))}</code>` : ""}
+             <code>${esc(p.event_ref?.ref || "")}</code></span>`
+          : '<span class="muted small">上游阶段尚未结算</span>')}
+    </li>`).join("");
+  const blockers = (g.active_blockers || []).map((b) =>
+    `<li class="branch-waiting">⛔ ${esc(b.label)}${b.sealed_mismatch ? "（结局已确定不符）" : ""}
+     <code>${esc(b.event_ref?.ref || "")}</code></li>`).join("");
+  const card = el(`<div class="box review-gate ${esc(g.status)}" data-status="${esc(g.status)}"
+      data-members="${esc([...members].join(","))}">
+    <div class="row">
+      <strong>#${i + 1} ${esc(g.title)}</strong>
+      <span class="chip mono">${esc(g.id)}</span>
+      <span class="chip ${sCls}">${sLabel}</span>
+      ${g.evidence_partial ? '<span class="chip warn" title="目标前缀含注入，但授权前置在前缀之外">证据不完整</span>' : ""}
+      <span class="spacer"></span>
+      <span class="muted small">→ <code>${esc(g.target_session)}</code>
+        阶段「${esc(g.target_stage_title)}」</span>
+    </div>
+    <ul class="branch-list">${branches}</ul>
+    <div class="row small" style="margin-top:6px">
+      <span class="chip mono">汇合后等待 ${g.wait_seconds ?? "—"} 秒</span>
+      <span class="chip mono">AND 汇合 ${g.assembly_seconds ?? "—"} 秒</span>
+      ${g.age_seconds != null ? `<span class="chip mono">截至时已等待 ${g.age_seconds} 秒</span>` : ""}
+      <span class="spacer"></span>
+      ${g.delivered_at ? `<span class="muted small">投递 ${fmtTime(g.delivered_at)}
+        <code>${esc(g.injection_ref?.ref || "")}</code></span>` : ""}
+      ${g.closed_at ? `<span class="muted small">窗口关闭 ${fmtTime(g.closed_at)}
+        <code>${esc(g.close_ref?.ref || "")}</code></span>` : ""}
+    </div>
+    ${g.bottleneck_branch ? `<p class="muted small" style="margin:6px 0 0">
+      汇合瓶颈分支：${esc(g.bottleneck_branch.label)}
+      <code>${esc(g.bottleneck_branch.event_ref?.ref || "")}</code>
+      ${g.bottleneck_branch.earlier_branch_lead_seconds.length
+        ? `（其他分支提前 ${g.bottleneck_branch.earlier_branch_lead_seconds.join("、")} 秒）` : ""}
+    </p>` : ""}
+    ${blockers ? `<ul class="branch-list small">${blockers}</ul>` : ""}
+    ${g.block_reason ? `<p class="block-reason">⛔ ${esc(g.block_reason)}</p>` : ""}
+    ${g.critical_path && g.critical_path.gate_ids.length > 1 ? `<p class="muted small" style="margin-bottom:0">
+      沿分支链关键路径：${g.critical_path.gate_ids.map((x) => `<code>${esc(x)}</code>`).join(" → ")}
+      （累计 ${g.critical_path.cumulative_wait_seconds} 秒）</p>` : ""}
+  </div>`);
+  card.dataset.text = card.textContent.toLowerCase();
+  return card;
+}
+
+function reviewTimelineRow(e, rep) {
+  const markHtml = (e.marks || []).map((m) => {
+    if (m.kind === "stage_settlement" || m.kind === "session_end") return "";
+    const g = m.gate_id ? rep.gates.find((x) => x.id === m.gate_id) : null;
+    const cls = {
+      branch_hit: "ok", branch_miss: "danger", injection: "host",
+      target_open: "", target_close: "warn", prereq_outcome: "",
+    }[m.kind] || "";
+    const kindLabel = {
+      prereq_outcome: "前置结局", branch_hit: "分支命中", branch_miss: "分支不符",
+      target_open: "目标开放", target_close: "目标结算", injection: "注入",
+    }[m.kind] || m.kind;
+    return `<span class="chip ${cls}">${kindLabel}${g ? " · " + esc(g.title) : ""}</span>`;
+  }).join("");
+  const member = rep.members[e.member_ord];
+  const gateMarks = (e.marks || []).filter((m) => m.gate_id)
+    .map((m) => rep.gates.find((x) => x.id === m.gate_id)).filter(Boolean);
+  const row = el(`<div class="tl-row ${esc(e.type)}">
+    <div class="row">
+      <span class="mono small">${fmtTime(e.at)}</span>
+      <span class="chip mono small" title="${esc(e.session_id)}">#${e.member_ord} ${esc(e.session_id.slice(0, 4))}…</span>
+      <span class="muted small">${esc(member ? member.drill_name : "")}</span>
+      <code class="small">v${e.version}.${e.seq} ${esc(e.type)}</code>
+      <span class="spacer"></span><span class="small">${esc(e.label)}</span>
+    </div>
+    ${markHtml ? `<div class="tl-marks">${markHtml} <code class="muted small">${esc(e.event_ref)}</code></div>`
+      : `<div class="tl-marks muted small"><code>${esc(e.event_ref)}</code></div>`}
+  </div>`);
+  row.dataset.session = e.session_id;
+  row.dataset.marks = JSON.stringify((e.marks || []).map((m) => m.kind));
+  row.dataset.gates = JSON.stringify(gateMarks.map((g) => ({ id: g.id, status: g.status })));
+  row.dataset.text = row.textContent.toLowerCase();
+  return row;
 }
 
 // --------------------------------------------------------------------------- //
@@ -1338,15 +1804,13 @@ function hostSessionPage(sid) {
     for (const r of snap.roles) {
       const p = joined[r.id];
       const link = `${location.origin}/#/join/${sid}?invite=${encodeURIComponent(r.invite)}`;
-      const tr = el(`<tr>
+      const tr = addRow(table.querySelector("tbody"), `
         <td>${esc(r.name)}</td>
         <td class="mono">${esc(r.invite)}</td>
         <td>${p ? esc(p.display_name) : '<span class="muted">未加入</span>'}</td>
         <td>${p ? (p.online ? '<span class="conn on">●在线</span>' : '<span class="conn off">○离线</span>') : ""}</td>
-        <td><div class="copybox"><code>${esc(link)}</code><button class="ghost">复制</button></div></td>
-      </tr>`);
+        <td><div class="copybox"><code>${esc(link)}</code><button class="ghost">复制</button></div></td>`);
       tr.querySelector("button").onclick = () => copyText(link);
-      table.querySelector("tbody").appendChild(tr);
     }
     people.appendChild(table);
 

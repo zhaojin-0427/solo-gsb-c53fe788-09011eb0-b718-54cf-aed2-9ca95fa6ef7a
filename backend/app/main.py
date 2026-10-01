@@ -606,6 +606,39 @@ async def api_session_script(
 
 
 # --------------------------------------------------------------------------- #
+# Joint causal-timeline postmortem (联演因果时序复盘, host only, read-only)
+# --------------------------------------------------------------------------- #
+class PostmortemBody(BaseModel):
+    # mode=as_of: one unified cutoff POSIX timestamp; strict "< cutoff" prefix.
+    # mode=prefix: one frozen event-version prefix per member session.
+    mode: str
+    as_of: float | None = None
+    prefixes: dict[str, int] | None = None
+
+
+@app.post("/api/joints/{joint_id}/postmortem")
+async def api_joint_postmortem(
+    joint_id: str,
+    body: PostmortemBody,
+    x_host_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Deterministic causal-timeline review at a consistent cutoff.
+
+    The response is a pure function of each member session's pinned script
+    version and immutable event log: late or same-second events never rewrite
+    an existing prefix, so re-requesting the same cutoff returns the same
+    report. The host console downloads this JSON verbatim.
+    """
+    check_host(x_host_key)
+    try:
+        return await joints.review_joint(
+            joint_id, {"mode": body.mode, "as_of": body.as_of, "prefixes": body.prefixes}
+        )
+    except JointError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+
+# --------------------------------------------------------------------------- #
 # WebSocket: /ws/{session_id}?token=...&host=...
 # --------------------------------------------------------------------------- #
 @app.websocket("/ws/{session_id}")
