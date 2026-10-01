@@ -1,0 +1,315 @@
+# 演练剧本：化工厂反应釜泄漏与次生火灾
+#
+# 阶段流转示意（^=超时未提交时的分支）：
+#   alarm(报警确认) ── eva=order ∧ cmd=evacuate ─▶ assess
+#                   └─ eva=ignore（或任一超时） ─▶ spill_worse
+#   assess(先期处置) ── eva=cutoff ∧ saf=monitor_ok ─▶ contained
+#                    ├─ eva=cutoff ∧ saf=alarm_gas ▶ fire
+#                    ├─ eva=wait（或超时） ─────────▶ spill_worse
+#   spill_worse(泄漏扩大) ─▶ fire
+#   contained(泄漏受控) ─▶ review
+#   fire(次生火灾) ── cmd=attack ∧ eva=foam ─▶ fire_attack
+#                  └─ cmd=defend（或超时） ─▶ fire_defend
+#   fire_attack(强攻灭火) ─▶ review
+#   fire_defend(退守控制) ─▶ review
+#   review(复盘总结)：终局
+id: chem-plant
+name: 化工厂反应釜泄漏与次生火灾
+description: >-
+  多人协同应急演练。值班班长、外操员、安全员依据各自角色信息在限时内提交决策，
+  主持人可随时手动结算或终止；到达截止时刻未提交的角色按超时处理并触发预设分支。
+
+# ---------------------------------------------------------------------------
+# 角色：每个角色一个专属邀请码（参与者凭码加入，仅可见本角色内容）
+# ---------------------------------------------------------------------------
+roles:
+  - id: cmd
+    name: 值班班长
+    invite: CMD-2026
+  - id: eva
+    name: 外操员
+    invite: EVA-2026
+  - id: saf
+    name: 安全员
+    invite: SAF-2026
+
+# ---------------------------------------------------------------------------
+stages:
+  # ===== 阶段 1：报警确认（45 秒）=====
+  - id: alarm
+    title: 报警确认
+    public: >-
+      凌晨 02:13，R-302 反应釜区可燃气体报警器连续动作，DCS 显示釜压上升、
+      搅拌电流异常。现场有 2 名巡检人员。
+    announcement: 请立即确认警情性质并下达先期指令。
+    duration: 45
+    default_next: assess
+    views:
+      cmd: >-
+        你在中控室。DCS 历史趋势显示压力 10 分钟内从 0.3MPa 升至 0.6MPa；
+        消防泵处于自动位，应急广播可用。厂长电话暂未接通。
+      eva: >-
+        你距 R-302 约 60 米，能闻到刺鼻气味，看到釜底法兰处有雾状气体。
+        现场防爆对讲机、便携式可燃气检测仪在手。
+      saf: >-
+        你查到该釜当班物料为甲苯与双氧水体系；今夜东南风 3 级，
+        下风向 300 米为厂前区值守楼。
+    options:
+      cmd:
+        - id: evacuate
+          text: 立即启动应急广播，组织人员撤离并核实情况
+        - id: hold
+          text: 暂不广播，要求现场先口头确认后再决定
+      eva:
+        - id: order
+          text: 指令现场人员撤至上风向，自己抵近检测
+        - id: ignore
+          text: 认为可能是误报，让巡检人员就地复位报警器
+    transitions:
+      - when: {cmd: evacuate, eva: order}
+        next: assess
+      - when: {cmd: hold}
+        next: spill_worse
+      - when: {eva: ignore}
+        next: spill_worse
+
+  # ===== 阶段 2：先期处置评估（30 秒）=====
+  - id: assess
+    title: 先期处置评估
+    public: >-
+      人员已撤至上风向集合点。R-302 法兰泄漏仍在持续，
+      便携式检测仪读数持续上升。
+    announcement: 请判断是切断物料控源，还是等待增援。
+    duration: 30
+    default_next: spill_worse
+    views:
+      cmd: >-
+        DCS 显示上游进料切断阀 XV-302 可远程关闭；
+        关闭后釜内反应可能因配比失衡出现短时温冲。
+      eva: >-
+        现场确认法兰密封面有液体滴落并气化；
+        手动切断阀位于距泄漏点约 15 米处，需要佩戴空气呼吸器操作。
+      saf: >-
+        气体检测仪读数 18% LEL 且上升中；
+        厂救援队 8 分钟可达，周边固定消防炮可先行冷却。
+    options:
+      cmd:
+        - id: remote_close
+          text: 远程关闭 XV-302，同步开启消防炮冷却
+        - id: wait_support
+          text: 不冒险操作，等待救援队到场
+      eva:
+        - id: cutoff
+          text: 佩戴呼吸器，前往手动切断阀配合断料
+        - id: wait
+          text: 撤至安全区待命，不抵近操作
+      saf:
+        - id: monitor_ok
+          text: 持续监测，报告浓度可控、可配合断料
+        - id: alarm_gas
+          text: 报告浓度逼近爆炸下限，建议全员后撤
+    transitions:
+      - when: {eva: cutoff, saf: monitor_ok}
+        next: contained
+      - when: {eva: cutoff, saf: alarm_gas}
+        next: fire
+      - when: {cmd: remote_close, saf: alarm_gas}
+        next: fire
+      - when: {eva: wait}
+        next: spill_worse
+      - when: {cmd: wait_support}
+        next: spill_worse
+
+  # ===== 阶段 3a：泄漏扩大 =====
+  - id: spill_worse
+    title: 泄漏扩大
+    public: >-
+      错失先期处置窗口。法兰泄漏量明显增大，围堰内积液面积扩大，
+      现场可燃气浓度达到 28% LEL，电气设备区域出现隐患。
+    announcement: 泄漏已无法仅靠现场手段控制，做好次生火灾准备。
+    duration: 20
+    default_next: fire
+    views:
+      cmd: 你现在能远程切断进料，但切断动作可能产生静电火花。
+      eva: 你已撤至上风向，看到泄漏点附近有非防爆叉车正在驶离。
+      saf: 你判定随时可能发生闪燃，建议扩大警戒至 500 米。
+    options:
+      cmd:
+        - id: remote_close
+          text: 果断远程切断进料，承担火花风险
+        - id: evac_more
+          text: 不操作，先扩大撤离范围
+      eva:
+        - id: warn_forklift
+          text: 冲出去拦下叉车，防止其驶入危险区
+        - id: hold_position
+          text: 原地观察，等待新指令
+      saf:
+        - id: expand_zone
+          text: 立即扩大警戒并清点人数
+        - id: call_119
+          text: 直接拨打 119 请求外部增援
+
+  # ===== 阶段 3b：泄漏受控 =====
+  - id: contained
+    title: 泄漏受控
+    public: >-
+      进料成功切断，固定消防炮实施冷却，气体浓度开始下降。
+      围堰积液正在转入应急收集槽。
+    announcement: 险情初步受控，请安排现场保护与复盘准备。
+    duration: 30
+    default_next: review
+    views:
+      cmd: 釜压已回落，厂长要求 30 分钟内提交事件初步报告。
+      eva: 手动阀关闭到位，但你发现法兰螺栓有两条明显锈蚀。
+      saf: 浓度降至 4% LEL；建议保留围堰积液取样，禁止现场复位送电。
+    options:
+      cmd:
+        - id: report
+          text: 按实际时间线如实编写事件初报
+        - id: downplay
+          text: 初报中弱化处置延误，避免追责
+      eva:
+        - id: preserve
+          text: 保护锈蚀螺栓等物证，拍照留档
+        - id: cleanup
+          text: 立即清理现场，争取早点恢复生产
+      saf:
+        - id: sample
+          text: 安排积液取样并维持断电挂牌
+        - id: reset
+          text: 浓度安全后同意尽快复位送电
+
+  # ===== 阶段 4：次生火灾 =====
+  - id: fire
+    title: 次生火灾
+    public: >-
+      R-302 下方围堰积液被引燃，地面流淌火蔓延，火焰烘烤反应釜外壁，
+      厂救援队已到场，外部消防力量 6 分钟后到达。
+    announcement: 请决定灭火战术：强攻近战还是退守控制。
+    duration: 35
+    default_next: fire_defend
+    views:
+      cmd: >-
+        你是现场总指挥。釜体已受火烘烤约 4 分钟；
+        泡沫消防车 1 辆、水 2 车载量。
+      eva: >-
+        你熟悉装置区消防设施，知道釜区北侧有半固定泡沫接口，
+        但要抵达需穿过约 20 米辐射热区域。
+      saf: >-
+        你监测到釜体异响、局部漆面鼓胀；
+        一旦反应釜物理爆炸，波及半径可能超过 100 米。
+    options:
+      cmd:
+        - id: attack
+          text: 组织突击队，泡沫覆盖灭火、同步冷却釜体
+        - id: defend
+          text: 放弃近战，全员退守、冷却防爆、等待外援
+      eva:
+        - id: foam
+          text: 请战带领两人占领北侧泡沫接口
+        - id: cool_only
+          text: 只在远距离操作水炮冷却，不进入辐射区
+      saf:
+        - id: risk_ok
+          text: 评估短时间强攻风险可控，建议抓紧窗口期
+        - id: risk_bleve
+          text: 发出爆炸风险警告，要求立即后撤扩大警戒
+    transitions:
+      - when: {cmd: attack, eva: foam}
+        next: fire_attack
+      - when: {cmd: defend}
+        next: fire_defend
+      - when: {saf: risk_bleve}
+        next: fire_defend
+      - when: {eva: cool_only}
+        next: fire_defend
+
+  # ===== 阶段 5a：强攻灭火 =====
+  - id: fire_attack
+    title: 强攻灭火
+    public: >-
+      突击队顶着辐射热占领泡沫接口，泡沫顺利覆盖流淌火，
+      水炮持续冷却釜体，火势被压下。
+    announcement: 火势得到控制，请组织余火清理与防复燃。
+    duration: 25
+    default_next: review
+    views:
+      cmd: 外部消防队已到场，可移交现场指挥权。
+      eva: 你的空呼气量剩余约 40%，泡沫管路需要有人持续值守。
+      saf: 复燃风险仍在，要求热成像监测釜体温度至少 1 小时。
+    options:
+      cmd:
+        - id: handover
+          text: 按程序移交指挥并保留应急处置记录
+        - id: resume_early
+          text: 宣布解除警报，安排尽快复工
+      eva:
+        - id: keep_guard
+          text: 组织轮换值守泡沫接口，防止复燃
+        - id: pull_out
+          text: 体力透支，带队撤回休整
+      saf:
+        - id: thermal_watch
+          text: 坚持热成像监测与气体复测双确认
+        - id: visual_only
+          text: 目视无明火即确认安全
+
+  # ===== 阶段 5b：退守控制 =====
+  - id: fire_defend
+    title: 退守控制
+    public: >-
+      全员撤至安全距离，水炮与固定炮持续冷却反应釜、保护相邻装置。
+      外部消防队到场后统一组织总攻，明火被扑灭，未发生爆炸。
+    announcement: 险情解除，请评估退守决策并准备复盘。
+    duration: 25
+    default_next: review
+    views:
+      cmd: 围堰烧毁严重，但装置主体与人员安全；上级要求完整复盘。
+      eva: 北侧泡沫接口在着火期间未能使用，阀门位置需要重新评估。
+      saf: 事后检测显示釜体已接近失效临界，事后看后撤是正确选择。
+    options:
+      cmd:
+        - id: honest_review
+          text: 完整保留时间线，组织正式复盘
+        - id: skip_review
+          text: 按意外事故简单结案
+      eva:
+        - id: redesign
+          text: 提交消防设施可达性改造建议
+        - id: no_comment
+          text: 不提交书面意见
+      saf:
+        - id: report_margin
+          text: 整理爆炸临界测算数据，纳入复盘
+        - id: keep_internal
+          text: 关键数据仅口头汇报
+
+  # ===== 阶段 6：复盘总结（终局，无时限：主持人手动结算/终止）=====
+  - id: review
+    title: 复盘总结
+    public: >-
+      应急响应结束。请各角色基于本角色掌握的信息提交复盘意见，
+      主持人结束演练后可导出个人记录与主持人全量记录。
+    announcement: 演练结束，请完成复盘提交。
+    duration: null
+    views:
+      cmd: 重点复盘指挥决策时机、信息上报与跨部门协同。
+      eva: 重点复盘现场可达性、个体防护与装备配置。
+      saf: 重点复盘风险研判依据、警戒距离与监测数据链。
+    options:
+      cmd:
+        - id: lessons
+          text: 提交完整经验教训与整改清单
+        - id: close
+          text: 宣布演练结束，不再提交
+      eva:
+        - id: lessons
+          text: 提交现场处置改进建议
+        - id: close
+          text: 无补充意见
+      saf:
+        - id: lessons
+          text: 提交风险监测与预警改进建议
+        - id: close
+          text: 无补充意见

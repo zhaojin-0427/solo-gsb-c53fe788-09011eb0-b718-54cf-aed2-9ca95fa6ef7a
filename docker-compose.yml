@@ -1,0 +1,26 @@
+services:
+  drill:
+    build: .
+    image: emergency-drill:latest
+    container_name: emergency-drill
+    ports:
+      - "8000:8000"
+    environment:
+      # 主持人密钥：生产环境务必修改
+      HOST_KEY: "host-1234"
+      DATA_DIR: /data
+      DRILLS_DIR: /drills
+      STATIC_DIR: /app/frontend
+      TZ: Asia/Shanghai
+    volumes:
+      - drill-data:/data
+      - ./drills:/drills:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  drill-data:
