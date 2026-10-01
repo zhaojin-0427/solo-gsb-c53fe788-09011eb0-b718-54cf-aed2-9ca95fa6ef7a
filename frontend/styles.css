@@ -197,3 +197,29 @@ label select { display: block; margin-top: 4px; min-width: 220px; }
 .box.injection .injection-title { font-weight: 700; }
 .g-views label { display: block; margin-top: 8px; }
 #joint-panel .chip { font-size: .76rem; }
+
+/* ---- joint causal retrospective ---- */
+.retro-prefixes label { font-size: .85rem; }
+.retro-gate { border-left: 4px solid var(--muted); }
+.retro-gate.delivered { border-left-color: var(--ok); }
+.retro-gate.awaiting_open { border-left-color: #a5b8ff; }
+.retro-gate.missed { border-left-color: var(--danger); }
+.retro-gate.unmet { border-left-color: var(--warn); }
+.retro-metrics .chip { font-size: .78rem; margin: 2px 4px 2px 0; }
+.retro-refs { margin-top: 8px; line-height: 1.7; }
+.retro-timeline { max-height: 560px; overflow: auto; border: 1px solid var(--border);
+  border-radius: 10px; }
+.retro-row {
+  display: grid; grid-template-columns: 86px 34px minmax(150px,1.2fr) 64px minmax(180px,1.4fr) minmax(220px,2fr);
+  gap: 8px; align-items: baseline; padding: 5px 10px; border-bottom: 1px solid var(--border);
+  font-size: .83rem;
+}
+.retro-row:nth-child(odd) { background: var(--panel-2); }
+.retro-row .retro-time { font-size: .8rem; color: var(--muted); }
+.retro-row .retro-title { overflow-wrap: anywhere; }
+.retro-marks { display: flex; flex-wrap: wrap; gap: 4px; }
+.retro-marks .chip { font-size: .72rem; }
+@media (max-width: 900px) {
+  .retro-row { grid-template-columns: 1fr; gap: 2px; }
+}
+

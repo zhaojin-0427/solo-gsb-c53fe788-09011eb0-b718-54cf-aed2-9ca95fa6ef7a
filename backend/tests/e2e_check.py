@@ -50,6 +50,14 @@ from app.joints import (  # noqa: E402
 )
 from app.main import app  # noqa: E402
 from app.records import build_replay, load_events  # noqa: E402
+from app.retrospective import (  # noqa: E402
+    AWAITING_OPEN,
+    DELIVERED,
+    MISSED,
+    RetroBuilder,
+    RetroError,
+    UNMET,
+)
 from app.snapshots import build_snapshot  # noqa: E402
 from app.versions import content_digest  # noqa: E402
 
@@ -1052,6 +1060,47 @@ def test_joint_http_ws():
         r = client.delete(f"/api/joints/{jid}", headers=HOST)
         check("删除含已投递门禁联演 409", r.status_code == 409)
 
+        # ---- [14b] 联演因果时序复盘 endpoint -------------------------------
+        # no horizon -> 400, missing joint -> 404, auth required
+        check("复盘接口需主持人密钥",
+              client.post(f"/api/joints/{jid}/retrospective", json={"cutoff": 1.0}).status_code == 401)
+        check("复盘缺少截止口径 400",
+              client.post(f"/api/joints/{jid}/retrospective", headers=HOST, json={}).status_code == 400)
+        check("复盘未知联演 404",
+              client.post("/api/joints/deadbeef/retrospective", headers=HOST,
+                          json={"cutoff": time.time() + 3600}).status_code == 404)
+        inj_row = client.get(
+            f"/api/sessions/{sd}/record", params={"fmt": "json"}, headers=HOST).json()
+        # derive the injection timestamp from the delivered record
+        inj_ts = next(
+            i["at"] for s in inj_row["stages"] for i in s.get("joint_injections", []))
+        rep = client.post(f"/api/joints/{jid}/retrospective", headers=HOST,
+                          json={"cutoff": inj_ts + 1e-6}).json()
+        g = rep["gates"][0]
+        check("复盘 HTTP 已投递", g["status"] == "delivered" and g["wait_seconds"] >= 0)
+        check("复盘 HTTP 带冻结剧本版本",
+              all(m["drill_version"] and m["digest_short"] for m in rep["members"]))
+        check("复盘 HTTP 关键路径与瓶颈",
+              rep["critical_path"] == ["g1"] and rep["bottleneck_gate"] == "g1")
+        check("复盘 HTTP 时序稳定合并",
+              [(e["at"], e["session_ord"], e["version"], e["seq"]) for e in rep["timeline"]]
+              == sorted((e["at"], e["session_ord"], e["version"], e["seq"]) for e in rep["timeline"]))
+        # version-prefix mode reproduces a pre-delivery horizon
+        inj_v = g["injection_event"]["version"]
+        pf = client.post(f"/api/joints/{jid}/retrospective", headers=HOST,
+                         json={"version_prefix": {su: 999, su2: 999, sd: inj_v - 1}}).json()
+        check("复盘 HTTP 版本前缀为目标未开放",
+              pf["gates"][0]["status"] == "awaiting_open"
+              and pf["mode"] == "version_prefix")
+        # a cutoff strictly before delivery cannot show the injection (still
+        # the same wall-clock second: JSON round-trip may nudge the float by a
+        # sub-microsecond epsilon, so subtract an explicit 1e-4).
+        early = client.post(f"/api/joints/{jid}/retrospective", headers=HOST,
+                            json={"cutoff": inj_ts - 1e-4}).json()
+        check("复盘 HTTP 同秒事件不改写前缀",
+              early["gates"][0]["status"] != "delivered"
+              and early["gates"][0]["injection_event"] is None)
+
 
 def test_http_version_api():
     print("[11b] HTTP 版本管理 API")
@@ -1706,6 +1755,196 @@ async def test_joint_orchestration(eng):
     check("末帧快照携带注入", last["history"][0]["injections"])
 
 
+async def test_retrospective(eng):
+    print("[15] 联演因果时序复盘（稳定前缀/等待秒数/关键路径/阻塞追溯）")
+    jo = JointOrchestrator(eng.db, eng)
+    rb = RetroBuilder(eng.db, eng)
+    FUTURE = time.time() + 3600
+
+    async def hit_ts(sid, version):
+        rows = await eng.db.all(
+            "SELECT at FROM events WHERE session_id=? AND version=?", (sid, version))
+        return max(float(r["at"]) for r in rows)
+
+    # two upstream sessions feed an AND gate into a downstream session
+    su = await eng.create_session("jup")      # JUP: s1, role a, choices go/stop
+    su2 = await eng.create_session("jup2")    # JUP2: s1, role c, choice go
+    sd = await eng.create_session("jdown")    # JDOWN: t1 -> t2, role b
+    await eng.join(sd, "BBB", "乙")
+    await eng.start(sd)  # target stage t1 already open
+    spec = {
+        "name": "复盘联演", "members": [su, su2, sd],
+        "gates": [{
+            "id": "g1", "target_session": sd, "target_stage": "t1",
+            "title": "联动关阀", "public": "公开联动", "views": {"b": "乙的联动细节"},
+            "prerequisites": [
+                {"session_id": su, "stage_id": "s1", "kind": "choice",
+                 "role_id": "a", "value": "go"},
+                {"session_id": su2, "stage_id": "s1", "kind": "choice",
+                 "role_id": "c", "value": "go"},
+            ],
+        }],
+    }
+    jid = (await jo.create_joint(spec))["id"]
+
+    # horizon validation
+    try:
+        await rb.build(jid)
+        check("无截止口径被拒", False)
+    except RetroError as exc:
+        check("无截止口径被拒（400）", exc.status == 400)
+    try:
+        await rb.build("deadbeef", cutoff=FUTURE)
+        check("不存在联演 404", False)
+    except RetroError as exc:
+        check("不存在联演 404", exc.status == 404)
+
+    rep = await rb.build(jid, cutoff=FUTURE)
+    check("未满足前置标记 unmet", rep["gates"][0]["status"] == UNMET)
+    check("阻塞原因列出未满足分支", "未满足" in rep["gates"][0]["block_reason"])
+    check("计数汇总未满足", rep["counts"]["unmet"] == 1 and rep["counts"]["total"] == 1)
+
+    # first upstream hits -> still unmet
+    await eng.join(su, "AAA", "甲")
+    await eng.start(su)
+    await eng.submit(su, "a", "s1", "go")  # s1 -> s2
+    await jo.reconcile_session(su)
+    rep = await rb.build(jid, cutoff=FUTURE)
+    g = rep["gates"][0]
+    check("单分支命中后仍 unmet",
+          g["status"] == UNMET and [p["satisfied"] for p in g["prerequisites"]] == [True, False])
+    hit_su_ev = g["prerequisites"][0]["hit_event"]
+    check("分支命中带可追溯事件引用",
+          hit_su_ev and hit_su_ev["session_id"] == su and hit_su_ev["type"] == "stage_sealed")
+
+    # unified cutoff BEFORE the second upstream seals: report must not change
+    await eng.join(su2, "CCC", "丙")
+    await eng.start(su2)
+    # capture a cutoff strictly after the su hit but before su2's submit commit
+    mid = time.time()
+    await eng.submit(su2, "c", "s1", "go")
+    await jo.reconcile_session(su2)
+    rep_pre = await rb.build(jid, cutoff=mid)
+    check("截止时刻早于提交：既成报告不被后来事件改写",
+          rep_pre["gates"][0]["status"] == UNMET
+          and rep_pre["gates"][0]["prerequisites"][1]["satisfied"] is False)
+    su2_versions = [
+        r["version"] for r in await eng.db.all(
+            "SELECT DISTINCT version FROM events WHERE session_id=? ORDER BY version", (su2,))]
+    seal_v = max(su2_versions)
+    seal_at = await hit_ts(su2, seal_v)
+
+    # cutoff EXACTLY at the seal commit second: same-second event excluded
+    rep_eq = await rb.build(jid, cutoff=seal_at)
+    check("同秒事件不进入截止前缀（严格小于）",
+          rep_eq["gates"][0]["status"] == UNMET
+          and rep_eq["gates"][0]["prerequisites"][1]["satisfied"] is False
+          and rep_eq["gates"][0]["injection_event"] is None)
+
+    # cutoff just after: delivered, wait measured from the LAST prerequisite.
+    # Use the actual injection commit instant as the exclusive bound + epsilon
+    # (delivery is a separate commit after the upstream seal).
+    inj_row = await eng.db.one(
+        "SELECT at FROM events WHERE session_id=? AND type='joint_injection'", (sd,))
+    inj_at = float(inj_row["at"])
+    check("注入提交晚于最后前置提交", inj_at >= seal_at)
+    rep = await rb.build(jid, cutoff=inj_at + 1e-6)
+    g = rep["gates"][0]
+    check("全分支齐后标记 delivered", g["status"] == DELIVERED)
+    check("等待秒数为最后前置到注入的非负值",
+          isinstance(g["wait_seconds"], (int, float)) and g["wait_seconds"] >= 0)
+    check("瓶颈分支为最后满足的第二上游",
+          g["bottleneck_branch"]["session_id"] == su2 and g["injection_event"] is not None)
+    check("注入事件可追溯到目标会话版本",
+          g["injection_event"]["session_id"] == sd and g["injection_event"]["type"] == "joint_injection")
+    check("截至报告标记冻结剧本版本",
+          {m["drill_id"] for m in rep["members"]} == {"jup", "jup2", "jdown"}
+          and all(m["drill_version"] for m in rep["members"]))
+
+    # merged timeline: stable ordering + every required marker kind present
+    tl = rep["timeline"]
+    keys = [(e["at"], e["session_ord"], e["version"], e["seq"]) for e in tl]
+    check("合并时序按(时间,会话序,版本,序号)稳定排序", keys == sorted(keys))
+    check("同秒跨会话事件保持会话顺序号",
+          all(tl[i]["session_ord"] <= tl[i + 1]["session_ord"]
+              for i in range(len(tl) - 1) if abs(tl[i]["at"] - tl[i + 1]["at"]) < 1e-6))
+    marks = {m["kind"] for e in tl for m in e["marks"]}
+    for need, label in (("prerequisite_outcome", "前置结局标记"),
+                        ("branch_hit", "分支命中标记"),
+                        ("target_stage_open", "目标阶段开放标记"),
+                        ("injection", "注入标记"),
+                        ("stage_settled", "阶段结算标记")):
+        check(f"时序含{label}", need in marks)
+
+    # determinism: same horizon -> identical report apart from generated_at
+    rep2 = await rb.build(jid, cutoff=inj_at + 1e-6)
+    stable = lambda r: json.dumps(
+        {k: v for k, v in r.items() if k != "generated_at"},
+        sort_keys=True, ensure_ascii=False)
+    check("同一截止时刻两次报告一致", stable(rep) == stable(rep2))
+
+    # per-session version prefix reproduces an as-of state: cap the target
+    # BEFORE the injection version while keeping the upstream hit
+    inj_v = g["injection_event"]["version"]
+    rep_pf = await rb.build(jid, version_prefix={su: 999, su2: seal_v, sd: inj_v - 1})
+    gpf = rep_pf["gates"][0]
+    check("各成员版本前缀复现截至状态（目标未含注入）",
+          gpf["status"] == AWAITING_OPEN and gpf["injection_event"] is None
+          and all(p["satisfied"] for p in gpf["prerequisites"]))
+    check("前缀截断标记", any(m["prefix_truncated"] for m in rep_pf["members"]))
+
+    # a prefix that sees the injection but capped away its cause is flagged
+    rep_bad = await rb.build(jid, version_prefix={su: 0, su2: 0, sd: 999})
+    check("混合前缀因果不一致被标记",
+          rep_bad["gates"][0]["status"] == DELIVERED
+          and rep_bad["gates"][0]["horizon_consistent"] is False
+          and rep_bad["horizon_consistent"] is False)
+
+    # ---- second joint: missed window (target seals before any branch met) --
+    su3 = await eng.create_session("jup")
+    sd3 = await eng.create_session("jdown")
+    await eng.join(sd3, "BBB", "乙三")
+    await eng.start(sd3)
+    jid2 = (await jo.create_joint({
+        "name": "错过联演", "members": [su3, sd3],
+        "gates": [{
+            "id": "m1", "target_session": sd3, "target_stage": "t1",
+            "title": "来不及", "public": "x",
+            "prerequisites": [{"session_id": su3, "stage_id": "s1", "kind": "choice",
+                               "role_id": "a", "value": "go"}],
+        }],
+    }))["id"]
+    await eng.settle(sd3, "host")  # t1 seals (t2), no injection possible
+    await jo.reconcile_session(sd3)
+    rm = await rb.build(jid2, cutoff=FUTURE)
+    check("目标阶段先结算标记 missed", rm["gates"][0]["status"] == MISSED)
+    check("错过原因可追溯到目标结算事件",
+          "结算" in rm["gates"][0]["block_reason"]
+          and rm["gates"][0]["target_settle_event"] is not None)
+
+    # ---- third joint: all branches met, target never opens -----------------
+    su4 = await eng.create_session("jup")
+    sd4 = await eng.create_session("jdown")  # never joined/started
+    await eng.join(su4, "AAA", "甲四")
+    await eng.start(su4)
+    await eng.submit(su4, "a", "s1", "go")
+    jid3 = (await jo.create_joint({
+        "name": "等开放联演", "members": [su4, sd4],
+        "gates": [{
+            "id": "w1", "target_session": sd4, "target_stage": "t1",
+            "title": "等开放", "public": "x",
+            "prerequisites": [{"session_id": su4, "stage_id": "s1", "kind": "next_stage",
+                               "value": "s2"}],
+        }],
+    }))["id"]
+    await jo.reconcile_session(su4)
+    ro = await rb.build(jid3, cutoff=FUTURE)
+    check("前置齐目标未开放标记 awaiting_open",
+          ro["gates"][0]["status"] == AWAITING_OPEN)
+    check("阻塞原因提示等待目标阶段开放",
+          "目标会话尚未进入阶段" in ro["gates"][0]["block_reason"])
+
+
 async def test_cross_session_write_serialization(eng):
     print("[13b] 跨会话写事务在共享连接上串行化")
     # Two DIFFERENT sessions hold two different session locks; their write
@@ -1751,6 +1990,7 @@ async def engine_tests():
         await test_end_session(eng)
         await test_script_versions(eng)
         await test_joint_orchestration(eng)
+        await test_retrospective(eng)
         await test_cross_session_write_serialization(eng)
     finally:
         await db.close()

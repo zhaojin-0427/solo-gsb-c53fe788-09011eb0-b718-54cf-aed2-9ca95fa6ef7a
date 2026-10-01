@@ -38,6 +38,7 @@ from .records import (
     render_host_md,
     render_personal_md,
 )
+from .retrospective import RetroBuilder, RetroError
 from .snapshots import build_snapshot
 
 
@@ -81,6 +82,7 @@ engine = Engine(db)
 hub = Hub()
 timers = TimerService()
 joints = JointOrchestrator(db, engine)
+retro = RetroBuilder(db, engine)
 
 
 async def reconcile_and_broadcast(session_id: str) -> None:
@@ -259,6 +261,18 @@ class JointBody(BaseModel):
     description: str | None = ""
     members: list[str]
     gates: list[JointGate] | None = None
+
+
+class RetroBody(BaseModel):
+    """Unified review horizon for a joint causal retrospective.
+
+    At least one of ``cutoff`` (one POSIX timestamp applied to every member
+    session) or ``version_prefix`` (per-session version caps) must be given.
+    A version whose atomic commit lands at exactly ``cutoff`` (or later) is
+    excluded, so same-second/late events never rewrite an existing prefix.
+    """
+    cutoff: float | None = None
+    version_prefix: dict[str, int] | None = None
 
 
 def _joint_payload(body: JointBody) -> dict[str, Any]:
@@ -602,6 +616,22 @@ async def api_session_script(
     try:
         return await joints.session_script(session_id)
     except JointError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+
+@app.post("/api/joints/{joint_id}/retrospective")
+async def api_joint_retrospective(
+    joint_id: str,
+    body: RetroBody,
+    x_host_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """联演因果时序复盘：按统一截止时刻或各成员会话事件版本前缀，从各会话
+    冻结剧本版本与事件日志重建稳定合并时序、分支命中/注入/结算标记、关键
+    路径与阻塞原因。报告只读且确定，可直接作为 JSON 下载。"""
+    check_host(x_host_key)
+    try:
+        return await retro.build(joint_id, body.cutoff, body.version_prefix)
+    except RetroError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
 

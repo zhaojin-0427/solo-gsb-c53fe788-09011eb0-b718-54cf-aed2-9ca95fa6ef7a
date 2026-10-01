@@ -7,6 +7,7 @@
  *   #/host/session/<sid>       某会话的主持台（实时）
  *   #/host/joints              联合演练列表
  *   #/host/joint/<id|new>      联合演练编排编辑器 / 实时监控台
+ *   #/host/joint/<id>/retro    联演因果时序复盘
  *   #/join/<sid>[?invite=...]  参与者输入邀请码
  *   #/play/<sid>               参与者控制台（实时）
  *   #/replay/<sid>             确定性回放
@@ -186,6 +187,10 @@ function route() {
   if (parts[0] === "host" && parts[1] === "session" && parts[2]) {
     navContext.textContent = `主持人 · 会话 ${parts[2]}`;
     return hostSessionPage(parts[2]);
+  }
+  if (parts[0] === "host" && parts[1] === "joint" && parts[3] === "retro" && parts[2]) {
+    navContext.textContent = "主持人 · 联演因果时序复盘";
+    return retroPage(parts[2]);
   }
   if (parts[0] === "host" && parts[1] === "joint" && parts[2]) {
     navContext.textContent = `主持人 · 联合演练编排`;
@@ -436,6 +441,7 @@ async function jointsPage() {
           <span class="chip danger">错过 ${j.missed_count}</span>
           <span class="muted small">${j.member_count} 个会话 · ${j.gate_count} 条编排</span>
           <span class="spacer"></span>
+          <a href="#/host/joint/${esc(j.id)}/retro"><button class="ghost">🕘 因果时序复盘</button></a>
           <a href="#/host/joint/${esc(j.id)}"><button class="ghost">打开编排 / 监控台</button></a>
         </div>
         <div class="muted small">${esc(j.description || "")}</div>
@@ -542,6 +548,10 @@ async function jointEditPage(jid) {
       </p>
     </div>
     ${detail ? `<div class="card"><h2>3. 主持台：分支等待状态与阻塞原因</h2>
+      <div class="row" style="margin-bottom:8px">
+        <a href="#/host/joint/${esc(detail.id)}/retro"><button>🕘 打开联演因果时序复盘</button></a>
+        <span class="muted small">选择统一复盘截止时刻或各成员会话事件版本前缀，生成稳定的截至时刻报告（支持筛选与 JSON 下载）。</span>
+      </div>
       <div id="monitor"><p class="muted small">载入中…</p></div>
       <p class="muted small" style="margin-bottom:0">本页每 2 秒自动刷新分支满足、
         释放/错过状态；注入投递的实时推送同时出现在目标会话参与者界面上。</p>
@@ -937,6 +947,358 @@ function renderMonitor(box, j) {
   }).join("");
   box.innerHTML = "";
   box.append(summary, membersCard, el(`<h3>注入编排与依赖状态</h3>`), el(gatesHtml || '<p class="muted small">无编排。</p>'));
+}
+
+// --------------------------------------------------------------------------- //
+// host: 联演因果时序复盘 (causal timeline retrospective)
+// --------------------------------------------------------------------------- //
+const RETRO_STATUS = {
+  delivered: ["已投递", "ok"],
+  awaiting_open: ["目标未开放", "host"],
+  missed: ["已错过", "danger"],
+  unmet: ["尚未满足", "warn"],
+};
+const RETRO_MARK = {
+  prerequisite_outcome: ["前置结局", "host"],
+  branch_hit: ["分支命中", "ok"],
+  target_stage_open: ["目标阶段开放", "ok"],
+  injection: ["注入", "host"],
+  stage_settled: ["阶段结算", ""],
+};
+
+async function retroPage(jid) {
+  app.innerHTML = `<div class="card"><h2>🕘 联演因果时序复盘</h2>
+    <p class="muted">加载中…</p></div>`;
+  let detail;
+  try {
+    detail = await api(`/api/joints/${encodeURIComponent(jid)}`, { host: true });
+  } catch (e) {
+    app.innerHTML = `<div class="card"><h2>联演因果时序复盘</h2>
+      <p class="chip danger">${esc(e.message)}</p>
+      <a href="#/host/joints"><button class="ghost">返回联演列表</button></a></div>`;
+    return;
+  }
+
+  const root = el(`<div>
+    <div class="card">
+      <div class="row">
+        <h2 style="margin:0">🕘 ${esc(detail.name)} · 因果时序复盘</h2>
+        <span class="chip mono">${esc(detail.id)}</span>
+        <span class="spacer"></span>
+        <a href="#/host/joint/${esc(detail.id)}"><button class="ghost">← 返回监控台</button></a>
+      </div>
+      <p class="muted small" style="margin-bottom:0">
+        系统读取各成员会话<strong>冻结的剧本版本</strong>与事件日志，按
+        <code>(事件时间, 会话顺序号, 版本, 序号)</code> 稳定合并；标出前置结局、分支命中、
+        目标阶段开放、注入与阶段结算，计算每条编排从最后前置满足到注入/错过的等待秒数，
+        汇总关键路径与瓶颈分支。迟到或同秒事件不会改写既有截至前缀。
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>统一复盘请求</h2>
+      <div class="row">
+        <label style="margin:0">复盘截止时刻
+          <input type="datetime-local" step="1" id="retro-dt" style="min-width:240px" />
+        </label>
+        <button id="retro-now" class="ghost" type="button">取当前时刻</button>
+        <button id="retro-cutoff" type="button">按统一截止时刻生成报告</button>
+      </div>
+      <p class="muted small">截止时刻按浏览器本地时区提交为 POSIX 秒；恰在该秒及之后提交的
+        事件版本<strong>不进入</strong>前缀。</p>
+
+      <div class="row" style="margin-top:6px">
+        <strong style="align-self:center">或按各成员会话事件版本前缀：</strong>
+      </div>
+      <div id="retro-prefixes" class="retro-prefixes"></div>
+      <div class="row">
+        <button id="retro-prefix" type="button">按版本前缀生成一致报告</button>
+        <span id="retro-state" class="muted small"></span>
+      </div>
+    </div>
+
+    <div id="retro-report" hidden></div>
+  </div>`);
+  app.innerHTML = "";
+  app.appendChild(root);
+
+  const dtInput = root.querySelector("#retro-dt");
+  const stateLine = root.querySelector("#retro-state");
+
+  // populate per-session prefix inputs with each member's max known version
+  const pfBox = root.querySelector("#retro-prefixes");
+  for (const m of detail.members) {
+    pfBox.appendChild(el(`<label class="box small" style="display:block;margin:4px 0">
+      <span class="mono">${esc(m.session_id)}</span>
+      <span class="muted small">${esc(m.drill_name)} · v${esc(m.drill_version)}</span>
+      <input type="number" min="0" step="1" data-sid="${esc(m.session_id)}"
+             placeholder="最新" style="width:90px" />
+      <span class="muted small">≤ 该版本号（留空=该会话不加前缀上限）</span>
+    </label>`));
+  }
+  // prefill each member prefix input with its current final version (from the
+  // deterministic replay endpoint; a version cap below reproduces an as-of view)
+  for (const inp of pfBox.querySelectorAll("input[type=number]")) {
+    api(`/api/sessions/${encodeURIComponent(inp.dataset.sid)}/replay`, { host: true })
+      .then((r) => { inp.value = r.final_version; })
+      .catch(() => { /* leave blank on failure */ });
+  }
+
+  root.querySelector("#retro-now").onclick = () => {
+    dtInput.value = toLocalInput(Date.now() / 1000);
+  };
+
+  async function request(body) {
+    stateLine.textContent = "生成中…";
+    try {
+      const rep = await api(
+        `/api/joints/${encodeURIComponent(detail.id)}/retrospective`,
+        { method: "POST", host: true, body });
+      renderRetroReport(root.querySelector("#retro-report"), rep);
+      stateLine.textContent = "";
+    } catch (e) {
+      stateLine.textContent = "";
+      toast(e.message, "error");
+    }
+  }
+
+  root.querySelector("#retro-cutoff").onclick = () => {
+    const t = localInputToTs(dtInput.value);
+    if (t == null) return toast("请选择有效的复盘截止时刻", "error");
+    request({ cutoff: t });
+  };
+  root.querySelector("#retro-prefix").onclick = () => {
+    const prefix = {};
+    for (const inp of pfBox.querySelectorAll("input[type=number]")) {
+      const v = inp.value.trim();
+      if (v !== "") prefix[inp.dataset.sid] = Number(v);
+    }
+    if (!Object.keys(prefix).length)
+      return toast("请至少为一个成员会话填写版本前缀", "error");
+    request({ version_prefix: prefix });
+  };
+
+  // default: report as of now so the page is immediately useful
+  dtInput.value = toLocalInput(Date.now() / 1000);
+  request({ cutoff: Date.now() / 1000 + 60 });
+}
+
+function toLocalInput(ts) {
+  const d = new Date(ts * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T`
+    + `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+function localInputToTs(v) {
+  if (!v) return null;
+  const t = new Date(v).getTime();
+  return Number.isNaN(t) ? null : t / 1000;
+}
+
+function renderRetroReport(box, rep) {
+  box.hidden = false;
+  const counts = rep.counts;
+  const gateById = Object.fromEntries(rep.gates.map((g) => [g.id, g]));
+
+  const filterBar = el(`<div class="card">
+    <div class="row">
+      <h2 style="margin:0">复盘结果</h2>
+      <span class="chip ${rep.horizon_consistent ? "ok" : "danger"}"
+        title="所有注入在其上游前缀内都有因果命中">
+        ${rep.horizon_consistent ? "截至前缀因果一致" : "混合前缀因果不一致"}</span>
+      <span class="chip mono">口径：${rep.mode === "cutoff" ? "统一截止时刻" : "版本前缀"}</span>
+      <span class="spacer"></span>
+      <button class="ghost" id="retro-download" type="button">⬇ 下载 JSON</button>
+    </div>
+    <p class="muted small" style="margin:6px 0 0">
+      截至时刻 T* = <b>${rep.effective_as_of != null ? fmtTime(rep.effective_as_of) : "（各会话日志全部纳入）"}</b>
+      （POSIX ${rep.effective_as_of ?? "—"}）
+      · 报告生成 ${fmtTime(rep.generated_at)}
+    </p>
+    <div class="row" style="margin-top:8px;flex-wrap:wrap">
+      <span class="chip ok">已投递 ${counts.delivered}</span>
+      <span class="chip host">目标未开放 ${counts.awaiting_open}</span>
+      <span class="chip danger">已错过 ${counts.missed}</span>
+      <span class="chip warn">尚未满足 ${counts.unmet}</span>
+      <span class="spacer"></span>
+      <label class="small" style="margin:0">筛选
+        <select id="retro-filter">
+          <option value="all">全部编排</option>
+          <option value="delivered">仅已投递</option>
+          <option value="awaiting_open">仅目标未开放</option>
+          <option value="missed">仅已错过</option>
+          <option value="unmet">仅尚未满足</option>
+          <option value="blocked">仅阻塞（非已投递）</option>
+        </select></label>
+      <label class="small" style="margin:0">关键词
+        <input type="text" id="retro-q" placeholder="标题/会话/阶段/阻塞原因" /></label>
+    </div>
+  </div>`);
+
+  // members card
+  const membersCard = el(`<div class="card"><h2>成员会话（冻结剧本版本与纳入前缀）</h2></div>`);
+  for (const m of rep.members) {
+    const [slabel, scls] = statusChip(m.status);
+    membersCard.appendChild(el(`<div class="box">
+      <div class="row">
+        <strong class="mono">${esc(m.session_id)}</strong>
+        <span class="muted small">#${m.ord}</span>
+        <span class="chip ${scls}">${slabel}</span>
+        <span class="muted small">${esc(m.drill_name)}</span>
+        <span class="chip mono" title="会话创建时固化">v${esc(m.drill_version)} · ${esc(m.digest_short)}</span>
+        ${m.prefix_truncated ? '<span class="chip warn" title="纳入版本早于最新提交">前缀截断</span>' : ""}
+        ${m.prefix_matches_horizon ? "" : '<span class="chip danger" title="该会话前缀边界不等于统一 T*">前缀不一致</span>'}
+        <span class="spacer"></span>
+        <span class="muted small">纳入版本 ≤ v${m.included_version}${m.prefix_truncated ? ` / 最新 v${m.max_version}` : ""}</span>
+      </div>
+      <div class="muted small">当前阶段：${esc(m.current_stage || "—")} ·
+        最后事件：${fmtTime(m.last_event_at)} ·
+        该会话截止边界：${m.bound_at != null ? fmtTime(m.bound_at) : "（无上界）"}</div>
+    </div>`));
+  }
+
+  // gates card (rendered by filter function)
+  const gatesCard = el(`<div class="card">
+    <h2>编排等待、关键路径与瓶颈</h2>
+    <div id="retro-gates"></div>
+  </div>`);
+
+  // timeline card
+  const timelineCard = el(`<div class="card">
+    <div class="row"><h2 style="margin:0">稳定合并时序</h2>
+      <span class="spacer"></span>
+      <label class="small" style="margin:0">标记
+        <select id="retro-mark-filter">
+          <option value="all">全部事件</option>
+          <option value="marked">仅含标记</option>
+          <option value="prerequisite_outcome">前置结局</option>
+          <option value="branch_hit">分支命中</option>
+          <option value="target_stage_open">目标阶段开放</option>
+          <option value="injection">注入</option>
+          <option value="stage_settled">阶段结算</option>
+        </select></label>
+    </div>
+    <div id="retro-timeline" class="retro-timeline"></div>
+  </div>`);
+
+  box.innerHTML = "";
+  box.append(filterBar, membersCard, gatesCard, timelineCard);
+
+  function gateCardHtml(g) {
+    const [stLabel, stCls] = RETRO_STATUS[g.status] || [g.status, ""];
+    const chain = (g.predecessor_chain || [])
+      .map((id) => gateById[id]?.title || id).join(" → ");
+    const branches = g.prerequisites.map((p) => `
+      <li class="${p.satisfied ? "branch-met" : "branch-waiting"}">
+        <span>${p.satisfied ? "✅" : "⏳"}</span>
+        <span>${esc(p.label)}</span>
+        ${p.hit_event ? `<span class="muted small">· 命中
+          v${esc(p.hit_event.version)}.${esc(p.hit_event.seq)}
+          @ ${fmtClock(p.hit_at)} <code>${esc(p.session_id)}</code></span>` : ""}
+      </li>`).join("");
+    const ref = (r, name) => r
+      ? `<a href="#/replay/${esc(r.session_id)}" target="_blank"
+           title="打开该会话回放 v${r.version}.${r.seq}">
+           <code>${name} v${esc(r.version)}.${esc(r.seq)}</code></a>`
+      : '<span class="muted small">—</span>';
+    const critical = g.critical ? '<span class="chip danger">关键路径</span>' : "";
+    return `<div class="box retro-gate ${esc(g.status)}" data-gid="${esc(g.id)}" data-status="${esc(g.status)}"
+        data-search="${esc((g.title + " " + g.target_session + " " + g.target_stage_title + " "
+          + (g.block_reason || "")).toLowerCase())}">
+      <div class="row">
+        <strong>${esc(g.title)}</strong>
+        <span class="chip mono">${esc(g.id)}</span>
+        <span class="chip ${stCls}">${stLabel}</span>
+        ${critical}
+        ${g.horizon_consistent ? "" : '<span class="chip danger">前缀因果不一致</span>'}
+        <span class="spacer"></span>
+        <span class="muted small">→ <code>${esc(g.target_session)}</code> 阶段「${esc(g.target_stage_title)}」</span>
+      </div>
+      <ul class="branch-list">${branches}</ul>
+      <div class="row retro-metrics" style="flex-wrap:wrap">
+        <span class="chip ${g.status === "delivered" ? "ok" : "host"}">
+          最后前置→${g.status === "delivered" ? "注入" : g.status === "missed" ? "窗口关闭" : "截至"}
+          等待 ${g.wait_seconds == null ? "—" : g.wait_seconds.toFixed(3) + " 秒"}
+        </span>
+        <span class="chip mono" title="沿分支链累计的等待秒数">链上累计 ${g.path_seconds ?? "—"} 秒</span>
+        ${g.bottleneck_branch ? `<span class="chip warn" title="AND 汇合中最后满足的分支">
+          瓶颈分支：${esc(g.bottleneck_branch.label)}</span>` : ""}
+      </div>
+      ${g.block_reason ? `<p class="block-reason">⛔ ${esc(g.block_reason)}</p>` : ""}
+      <p class="muted small retro-refs">
+        最后前置事件 ${ref(g.last_prerequisite_event, "前置")} ·
+        开放 ${ref(g.target_open_event, "开放")} ·
+        结算 ${ref(g.target_settle_event, "结算")} ·
+        注入 ${ref(g.injection_event, "注入")}
+        ${chain ? `· 分支链：<code>${esc(chain)} → ${esc(g.title)}</code>` : ""}
+      </p>
+    </div>`;
+  }
+
+  function renderGates() {
+    const f = filterBar.querySelector("#retro-filter").value;
+    const q = filterBar.querySelector("#retro-q").value.trim().toLowerCase();
+    const host = gatesCard.querySelector("#retro-gates");
+    const list = rep.gates.filter((g) => {
+      if (f === "blocked" ? g.status === "delivered" : (f !== "all" && g.status !== f))
+        return false;
+      if (q && !(`${g.title} ${g.target_session} ${g.target_stage_title} ${g.block_reason || ""} ${g.id}`
+          .toLowerCase().includes(q)))
+        return false;
+      return true;
+    });
+    host.innerHTML = list.length
+      ? list.map(gateCardHtml).join("")
+      : '<p class="muted small">无符合筛选的编排。</p>';
+    if (rep.bottleneck_gate) {
+      const b = gateById[rep.bottleneck_gate];
+      host.prepend(el(`<p class="muted small">瓶颈编排：<b>${esc(b.title)}</b>
+        （单条等待 ${b.wait_seconds?.toFixed(3)} 秒）；关键路径：
+        <code>${esc([...(b.predecessor_chain || []), b.id].join(" → "))}</code></p>`));
+    }
+  }
+
+  function markChipsHtml(marks) {
+    return marks.map((m) => {
+      const [label, cls] = RETRO_MARK[m.kind] || [m.kind, ""];
+      const extra = m.gate_title ? ` · ${m.gate_title}` : "";
+      return `<span class="chip ${cls}" title="${esc(m.branch_label || m.gate_title || "")}">
+        ${esc(label)}${esc(extra)}</span>`;
+    }).join(" ");
+  }
+
+  function renderTimeline() {
+    const f = timelineCard.querySelector("#retro-mark-filter").value;
+    const host = timelineCard.querySelector("#retro-timeline");
+    const rows = rep.timeline.filter((e) => {
+      if (f === "all") return true;
+      if (f === "marked") return e.marks.length > 0;
+      return e.marks.some((m) => m.kind === f);
+    });
+    host.innerHTML = rows.map((e) => `
+      <div class="retro-row" data-kind="${esc(e.type)}">
+        <span class="retro-time mono">${fmtClock(e.at)}</span>
+        <span class="chip mono">#${e.session_ord}</span>
+        <span class="muted small">${esc(e.drill_name)} <code>${esc(e.session_id)}</code></span>
+        <a href="#/replay/${esc(e.session_id)}" target="_blank" class="mono small">v${e.version}.${e.seq}</a>
+        <span class="retro-title">${esc(e.title)}</span>
+        <span class="retro-marks">${markChipsHtml(e.marks)}</span>
+      </div>`).join("") || '<p class="muted small">无事件。</p>';
+  }
+
+  filterBar.querySelector("#retro-filter").onchange = renderGates;
+  filterBar.querySelector("#retro-q").oninput = renderGates;
+  timelineCard.querySelector("#retro-mark-filter").onchange = renderTimeline;
+  filterBar.querySelector("#retro-download").onclick = () => {
+    const blob = new Blob([JSON.stringify(rep, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `joint-retrospective-${rep.joint_id}-${Math.round(rep.effective_as_of || rep.generated_at)}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+  renderGates();
+  renderTimeline();
 }
 
 // --------------------------------------------------------------------------- //

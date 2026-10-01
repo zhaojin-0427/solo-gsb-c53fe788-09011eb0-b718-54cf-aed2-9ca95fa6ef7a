@@ -25,6 +25,14 @@
   会话、阶段、结局、角色均有效；重复/乱序到达不会重复投递或提前解锁；主持台显示
   **分支等待状态与阻塞原因**。注入作为事件写入**目标会话自己的事件日志**，各会话
   仍保留独立的剧本版本与事件记录。
+- **联演因果时序复盘**：主持人对一场已保存联演提交**统一复盘截止时刻**（或各成员
+  会话的**事件版本前缀**），系统从各会话**冻结剧本版本与事件日志**重建截至时刻报告：
+  按 `(事件时间, 会话顺序号, 版本, 序号)` 稳定合并跨会话时序，标注**前置结局、分支
+  命中、目标阶段开放、注入、阶段结算**；为每条编排计算“最后一个前置满足 → 注入/
+  错过”的**等待秒数**，沿分支链汇总**关键路径与瓶颈分支**；区分
+  **尚未满足 / 目标未开放 / 已错过 / 已投递**并给出阻塞原因与可点击追溯的事件引用。
+  **同秒或迟到事件严格不进入前缀**（提交时刻必须 `<` 截止时刻），重复请求报告逐字节
+  一致；主持台提供状态/关键词筛选与 **JSON 下载**。
 
 ---
 
@@ -37,6 +45,7 @@
 │   │   ├── main.py          # FastAPI：HTTP API、WebSocket、定时结算、静态托管
 │   │   ├── engine.py        # 纯事件溯源 reducer + 原子提交（版本号/结算/幂等）
 │   │   ├── joints.py        # 联合演练编排：无环校验、AND 汇合仲裁、一次性注入投递
+│   │   ├── retrospective.py # 联演因果时序复盘：稳定前缀合并、等待秒数、关键路径/瓶颈
 │   │   ├── definitions.py   # YAML 剧本解析与校验
 │   │   ├── versions.py      # 不可变版本摘要（SHA-256）与结构化差异对比
 │   │   ├── db.py            # SQLite（WAL、立即事务、事件日志、版本表与迁移）
@@ -251,6 +260,9 @@ uvicorn app.main:app --reload --port 8000
    （等待中 / **前置已齐·等待目标阶段开放** / 已投递 / 已错过）以及
    **阻塞原因**。各会话自己的主持台也内嵌“🔗 联合演练状态”面板。
 5. 各会话照常开始、提交、结算；上游达成结局后系统自动仲裁并向目标会话推送。
+6. 演练中或结束后点击监控台的 **“🕘 打开联演因果时序复盘”**：提交统一复盘截止
+   时刻（或各成员会话事件版本前缀）即可得到稳定的截至时刻报告，支持按状态/关键词
+   筛选、按标记查看合并时序，并可 **下载完整 JSON**（详见“联演因果时序复盘”一节）。
 
 ### 一致性与边界
 
@@ -279,6 +291,154 @@ uvicorn app.main:app --reload --port 8000
 | DELETE | `/api/joints/{id}` | 删除全等待中的联演（主持人） |
 | GET | `/api/sessions/{sid}/joints` | 该会话参与的联演状态（主持台面板） |
 | GET | `/api/sessions/{sid}/script` | 该会话**绑定版本**的阶段/角色/选项（编辑器用） |
+| POST | `/api/joints/{id}/retrospective` | **联演因果时序复盘**：统一截止时刻或各会话事件版本前缀，返回稳定合并时序/等待秒数/关键路径/阻塞追溯（主持人） |
+
+---
+
+## 联演因果时序复盘
+
+联合演练进行中或结束后，主持人在 **联合演练监控台** 点击
+**“🕘 打开联演因果时序复盘”**（地址形如
+`http://localhost:8000/#/host/joint/<联演编号>/retro`；联合演练列表里每场联演也有
+**“🕘 因果时序复盘”** 按钮）。
+
+### 复盘口径（二选一，可组合）
+
+1. **统一复盘截止时刻**：在页面选择一个本地时间，提交为统一 POSIX 秒 `cutoff`，
+   对**所有成员会话**生效。一个原子提交（一个版本）只有当其提交时刻
+   **严格小于** `cutoff` 时才纳入报告——**恰在截止同秒或更晚到达的事件不进入前缀**，
+   因此报告生成后迟到、补写或同秒提交的事件永远不能改写既有报告。
+2. **各成员会话事件版本前缀**：为每个会话给出 `session_id → 版本号`，报告只包含
+   该会话 `version ≤ n` 的事件，用于精确复现“各成员当时分别停在第几个版本”的画面。
+   混合前缀若出现“目标已含注入、但其上游因果命中被前缀截掉”的情况，报告不会假装
+   一致：受影响编排与报告顶部会标记 **“前缀因果不一致”** 并给出修正建议。
+
+两种口径都把每个成员会话**创建时冻结的剧本版本**作为唯一剧本来源；报告完全由事件
+日志折叠重建，不依赖任何运行时内存状态，同一口径重复请求结果一致。
+
+### 报告内容
+
+- **成员会话**：会话顺序号、冻结剧本 `drill_version` 与摘要、当前/纳入版本号、
+  是否发生前缀截断、该会话的截止边界。
+- **稳定合并时序**：跨会话事件按 `(at, 会话顺序号, version, seq)` 排序——先按事件
+  时间，同秒再按成员顺序，最后按会话内因果顺序，同秒事件在任意两次报告之间次序
+  恒定；每条事件标出五类标记：`prerequisite_outcome` 前置结局、`branch_hit` 分支命中、
+  `target_stage_open` 目标阶段开放、`injection` 注入、`stage_settled` 阶段结算。
+- **每条编排**：四类状态之一——
+  `delivered 已投递` / `awaiting_open 目标未开放` / `missed 已错过` / `unmet 尚未满足`；
+  给出从**最后一个前置满足**到注入投递（或窗口关闭/截至时刻）的 `wait_seconds`，
+  AND 汇合中最后满足的 **瓶颈分支**，沿注入链累计的 `path_seconds`、整场的
+  **关键路径 `critical_path`** 与 **瓶颈编排 `bottleneck_gate`**；每条编排附
+  阻塞原因（如“目标阶段已结算，前置尚未全部满足”）与**可追溯事件引用**
+  （`session_id/version/seq/at/type`，点击直接打开该会话回放）。
+- 主持台支持按状态（含“仅阻塞”）与关键词筛选编排、按标记筛选时序，并用
+  **“⬇ 下载 JSON”** 把完整报告保存为文件
+  （`joint-retrospective-<联演编号>-<截止时刻>.json`）。
+
+### 真实复盘请求与响应示例
+
+以下示例由仓库自带脚本
+`python backend/tests/demo_retrospective.py` 对真实应用（隔离临时库）实跑产生：
+上游会话 `9a173b04` 的「泄漏研判」阶段值班长选择“确认扩大预警”（v3 结算），下游
+会话 `d45c6c25` 的「下游警戒」阶段先已开放（v2.1），AND 汇合后注入于 v3.0 投递。
+
+**请求**
+
+```http
+POST /api/joints/26e908ab/retrospective HTTP/1.1
+Host: localhost:8000
+X-Host-Key: host-1234
+Content-Type: application/json
+
+{"cutoff": 1790853826.47}
+```
+
+等价的 `curl`：
+
+```bash
+curl -s -X POST "http://localhost:8000/api/joints/26e908ab/retrospective" \
+  -H "X-Host-Key: host-1234" -H "Content-Type: application/json" \
+  -d '{"cutoff": 1790853826.47}'
+```
+
+按各成员会话事件版本前缀的请求（等价的一致截至画面，截止于“注入尚未写入”的瞬间）：
+
+```bash
+curl -s -X POST "http://localhost:8000/api/joints/26e908ab/retrospective" \
+  -H "X-Host-Key: host-1234" -H "Content-Type: application/json" \
+  -d '{"version_prefix": {"9a173b04": 3, "d45c6c25": 2}}'
+# => gates[0].status == "awaiting_open"（前置已齐、目标阶段已开放，注入版本不在前缀内）
+```
+
+**响应（节选；完整 JSON 可由主持台“下载 JSON”获取）**
+
+```json
+{
+  "kind": "joint_retrospective",
+  "joint_id": "26e908ab",
+  "joint_name": "厂际联动复盘示例",
+  "mode": "cutoff",
+  "cutoff": 1790853826.47,
+  "effective_as_of": 1790853826.47,
+  "horizon_consistent": true,
+  "counts": {"total": 1, "delivered": 1, "awaiting_open": 0, "missed": 0, "unmet": 0},
+  "critical_path": ["g1"],
+  "bottleneck_gate": "g1",
+  "members": [
+    {"session_id": "9a173b04", "ord": 0, "drill_id": "jup", "drill_name": "上游指挥中心",
+     "drill_version": 1, "digest_short": "738c4ea86be9", "status": "running",
+     "included_version": 3, "prefix_truncated": false},
+    {"session_id": "d45c6c25", "ord": 1, "drill_id": "jdown", "drill_name": "下游厂区",
+     "drill_version": 1, "digest_short": "494a2f3be1fe", "status": "running",
+     "included_version": 3, "prefix_truncated": false}
+  ],
+  "gates": [
+    {
+      "id": "g1",
+      "title": "上游预警联动",
+      "status": "delivered",
+      "status_label": "已投递",
+      "wait_seconds": 0.009,
+      "path_seconds": 0.009,
+      "critical": true,
+      "block_reason": null,
+      "target_session": "d45c6c25",
+      "target_stage": "t1",
+      "bottleneck_branch": "阶段「泄漏研判」值班长甲 选择＝确认扩大预警",
+      "last_prerequisite_event":
+        {"session_id": "9a173b04", "session_ord": 0, "version": 3, "seq": 1,
+         "at": 1790853825.46014, "type": "stage_sealed"},
+      "target_open_event":
+        {"session_id": "d45c6c25", "session_ord": 1, "version": 2, "seq": 1,
+         "at": 1790853825.44719, "type": "stage_opened"},
+      "injection_event":
+        {"session_id": "d45c6c25", "session_ord": 1, "version": 3, "seq": 0,
+         "at": 1790853825.46962, "type": "joint_injection"},
+      "prerequisites": [
+        {"label": "阶段「泄漏研判」值班长甲 选择＝确认扩大预警",
+         "satisfied": true, "hit_at": 1790853825.4601378,
+         "hit_event": {"session_id": "9a173b04", "session_ord": 0,
+                       "version": 3, "seq": 1, "at": 1790853825.46014,
+                       "type": "stage_sealed"}}
+      ]
+    }
+  ],
+  "timeline_marks_preview": [
+    {"at": 1790853825.447, "session_ord": 1, "v": "2.1",
+     "title": "目标阶段开放：下游警戒", "marks": ["target_stage_open"]},
+    {"at": 1790853825.46, "session_ord": 0, "v": "3.1",
+     "title": "阶段「泄漏研判」结算",
+     "marks": ["stage_settled", "prerequisite_outcome", "branch_hit"]},
+    {"at": 1790853825.47, "session_ord": 1, "v": "3.0",
+     "title": "联演注入：上游预警联动", "marks": ["injection"]}
+  ]
+}
+```
+
+> 把 `cutoff` 改成注入提交时刻 `1790853825.46962` 本身（同秒）再请求：该版本
+> `3.0` 不满足“严格小于”，编排回到 `awaiting_open`，`injection_event` 为 `null`——
+> 同秒事件不进入、更不能改写此前的前缀报告。缺少 `cutoff` 与 `version_prefix` 时
+> 接口返回 400；联演不存在返回 404；缺少主持人密钥返回 401。
 
 ---
 
@@ -405,6 +565,7 @@ stages:
 | GET | `/api/sessions/{sid}/record?fmt=md\|json&token=` | 全量记录（主持人）/ 个人记录（参与者），均标注剧本版本（含联演注入） |
 | GET | `/api/joints` · `POST /api/joints` · `GET/PUT/DELETE /api/joints/{id}` | 联合演练编排（主持人，见“联合演练编排”一节） |
 | GET | `/api/sessions/{sid}/joints` · `/api/sessions/{sid}/script` | 会话的联演状态 / 绑定剧本引用（主持人） |
+| POST | `/api/joints/{id}/retrospective` | **联演因果时序复盘**：body `{"cutoff": <POSIX 秒>}` 或 `{"version_prefix": {会话:版本}}`；返回稳定合并时序、等待秒数、关键路径/瓶颈、阻塞原因与事件引用（主持人），报告即 JSON 下载内容 |
 
 ### WebSocket
 
